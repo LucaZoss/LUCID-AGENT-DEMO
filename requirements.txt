@@ -1,0 +1,11 @@
+# Runtime
+litellm>=1.0
+rich>=13.0
+pyfiglet>=1.0
+
+# Provider SDK — install the one matching your model.
+# Default demo uses Claude via ANTHROPIC_API_KEY:
+anthropic>=0.20
+
+# Dev / test
+pytest>=7.0

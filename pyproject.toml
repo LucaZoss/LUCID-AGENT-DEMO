@@ -1,0 +1,28 @@
+[project]
+name = "lucid-finance-demo"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "litellm>=1.0",
+    "rich>=13.0",
+    "pyfiglet>=1.0",
+]
+
+[project.scripts]
+lucid-agent = "orchestrator.repl:main"
+
+[project.optional-dependencies]
+# Install the provider SDK that matches your model choice.
+# Claude (default demo):  uv sync --extra claude
+# OpenAI:                 uv sync --extra openai
+# All extras:             uv sync --all-extras
+claude = ["anthropic>=0.20"]
+openai = ["openai>=1.0"]
+dev    = ["pytest>=7.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.setuptools.packages.find]
+include = ["bank*", "db*", "llm*", "orchestrator*", "skills*", "tools*"]
