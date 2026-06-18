@@ -4,7 +4,7 @@ Polished TUI REPL for the LUCID personal finance agent.
 
 Presentation layer only — no business logic lives here.
 router.handle_message() returns plain text; this file is solely responsible
-for colors, panels, spinners, and every other terminal detail.
+for colors, panels, spinners, tables, and every other terminal detail.
 
 The router is client-agnostic: the same core serves this REPL, Telegram,
 and a future web UI without modification.
@@ -19,17 +19,22 @@ Run:
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timedelta
+import uuid
+from datetime import datetime, timedelta, timezone
 
 import pyfiglet
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.rule import Rule
+from rich.table import Table
 from rich.text import Text
 
+from bank import make_db_provider
+from bank.db_provider import DBBankingProvider
+from contracts import Transaction
 from db.db_schema import init_db
-from llm.config import build_adapter
+from llm.config import build_adapter, reconfigure_adapter
 from orchestrator.router import handle_message
 
 # ── Session constants ──────────────────────────────────────────────────────────
@@ -39,13 +44,12 @@ _CONV_ID  = "demo-conv-1"
 
 # ── Color palette ──────────────────────────────────────────────────────────────
 
-# Banner gradient: bright cyan at the top, deep blue at the bottom
 _BANNER_GRADIENT = [
-    "#67e8f9",  # cyan-300   — top
+    "#67e8f9",  # cyan-300
     "#38bdf8",  # sky-400
     "#0ea5e9",  # sky-500
     "#3b82f6",  # blue-500
-    "#2563eb",  # blue-600   — bottom
+    "#2563eb",  # blue-600
 ]
 
 _ACCENT       = "#38bdf8"   # sky-400  — prompts, panel borders, slash highlights
@@ -53,6 +57,13 @@ _ACCENT_DEEP  = "#1d4ed8"   # blue-700 — response panel border
 _RULE_COLOR   = "#0e7490"   # teal     — horizontal rules
 _DIM_TEXT     = "#64748b"   # slate-500
 _DIMMER_TEXT  = "#334155"   # slate-700
+_GREEN        = "#22c55e"
+_AMBER        = "#f59e0b"
+_RED          = "#ef4444"
+_NEED_COLOR   = "#f59e0b"   # amber   — needs
+_WANT_COLOR   = "#818cf8"   # indigo  — wants
+_SAVE_COLOR   = "#22c55e"   # green   — savings
+_INCOME_COLOR = "#34d399"   # emerald — income
 
 _CONSOLE = Console()
 
@@ -91,11 +102,9 @@ _DEMO_TRANSACTIONS: list[tuple[str, float, str | None]] = [
 # ── Banner ─────────────────────────────────────────────────────────────────────
 
 def _render_banner() -> None:
-    """ASCII-art title with a cyan → blue vertical gradient, plus subtitle."""
     art = pyfiglet.figlet_format("LUCID AGENT", font="slant")
     art_lines = art.rstrip("\n").split("\n")
 
-    # Only colour non-blank lines; distribute gradient evenly across them.
     content_lines = [l for l in art_lines if l.strip()]
     n = max(len(content_lines) - 1, 1)
 
@@ -114,7 +123,7 @@ def _render_banner() -> None:
     _CONSOLE.print(banner)
     _CONSOLE.print(Rule(style=f"dim {_RULE_COLOR}"))
     _CONSOLE.print(
-        f"[{_DIM_TEXT}]Personal finance assistant[/{_DIM_TEXT}]",
+        f"[{_DIM_TEXT}]Personal finance assistant · CHF[/{_DIM_TEXT}]",
         justify="center",
     )
     _CONSOLE.print(
@@ -128,18 +137,24 @@ def _render_banner() -> None:
     _CONSOLE.print()
 
 
-# ── Slash-command rendering ────────────────────────────────────────────────────
+# ── /help ──────────────────────────────────────────────────────────────────────
 
 def _render_help() -> None:
     body = Text()
     body.append("Commands\n\n", style="bold")
-    for cmd, desc in (
-        ("/help ", "show this message"),
-        ("/clear", "clear the screen (session continues)"),
-        ("/quit ", "exit"),
-    ):
-        body.append(f"  {cmd}   ", style=f"bold {_ACCENT}")
-        body.append(desc + "\n",   style="")
+    commands = [
+        ("/help             ", "show this message"),
+        ("/model            ", "configure LLM provider or API key"),
+        ("/account          ", "show account balance and last 10 transactions"),
+        ("/split            ", "show your live needs / wants / savings ratios"),
+        ("/goal             ", "show your active goal and feasibility"),
+        ("/fire <amt> <mer> ", "inject a test transaction (negative = outflow)"),
+        ("/clear            ", "clear the screen (session continues)"),
+        ("/quit             ", "exit"),
+    ]
+    for cmd, desc in commands:
+        body.append(f"  {cmd}", style=f"bold {_ACCENT}")
+        body.append(desc + "\n", style="")
 
     _CONSOLE.print(Panel(
         body,
@@ -149,14 +164,282 @@ def _render_help() -> None:
     ))
 
 
+# ── /model ─────────────────────────────────────────────────────────────────────
+
+def _cmd_model(current_llm):
+    """Let the user pick a new provider; return the new adapter."""
+    _CONSOLE.print(
+        f"\n[{_DIM_TEXT}]Current model: [bold]{current_llm.model}[/bold][/{_DIM_TEXT}]"
+    )
+    try:
+        new_llm = reconfigure_adapter(console=_CONSOLE)
+        _CONSOLE.print(
+            Panel(
+                f"[bold {_GREEN}]Provider set:[/bold {_GREEN}] {new_llm.model}",
+                border_style=f"dim {_ACCENT_DEEP}",
+                padding=(0, 1),
+            )
+        )
+        return new_llm
+    except (KeyboardInterrupt, SystemExit):
+        _CONSOLE.print(f"[{_DIM_TEXT}]Cancelled — keeping {current_llm.model}[/{_DIM_TEXT}]")
+        return current_llm
+
+
+# ── /account ───────────────────────────────────────────────────────────────────
+
+def _cmd_account(bank: DBBankingProvider) -> None:
+    """Display accounts and the last 10 transactions via the BankingProvider interface."""
+    accounts = bank.get_accounts()
+    if not accounts:
+        _CONSOLE.print(f"[{_DIM_TEXT}]No accounts found.[/{_DIM_TEXT}]")
+        return
+
+    for acc in accounts:
+        balance_color = _GREEN if acc.balance >= 0 else _RED
+        header = Text()
+        header.append(acc.name, style="bold")
+        header.append(f"   {acc.currency} ", style=f"dim {_DIM_TEXT}")
+        header.append(f"{acc.balance:,.2f}", style=f"bold {balance_color}")
+
+        txns = bank.get_transactions(acc.id, days=90)[:10]
+
+        if not txns:
+            _CONSOLE.print(Panel(
+                Text.assemble(header, "\n\n", (f"No recent transactions.", _DIM_TEXT)),
+                title=f"[bold {_ACCENT}]account[/bold {_ACCENT}]",
+                border_style=f"dim {_ACCENT_DEEP}",
+                padding=(0, 1),
+            ))
+            continue
+
+        tbl = Table(
+            box=None,
+            show_header=True,
+            header_style=f"bold {_DIM_TEXT}",
+            padding=(0, 1),
+        )
+        tbl.add_column("Date",     style=f"{_DIMMER_TEXT}", width=12)
+        tbl.add_column("Merchant", style="", min_width=26)
+        tbl.add_column("Category", width=9)
+        tbl.add_column("Amount (CHF)", justify="right", width=14)
+
+        for t in txns:
+            cat = t.category or "—"
+            cat_color = {
+                "need": _NEED_COLOR,
+                "want": _WANT_COLOR,
+                "savings": _SAVE_COLOR,
+            }.get(cat, _DIM_TEXT)
+
+            amt_color = _INCOME_COLOR if t.amount >= 0 else (
+                _RED if abs(t.amount) > 500 else ""
+            )
+            sign = "+" if t.amount >= 0 else ""
+
+            tbl.add_row(
+                t.ts.strftime("%d %b %Y"),
+                t.merchant,
+                f"[{cat_color}]{cat}[/{cat_color}]",
+                f"[{amt_color}]{sign}{t.amount:,.2f}[/{amt_color}]" if amt_color
+                else f"{sign}{t.amount:,.2f}",
+            )
+
+        inner = Text()
+        inner.append_text(header)
+        inner.append("\n")
+
+        _CONSOLE.print(Panel(
+            inner,
+            title=f"[bold {_ACCENT}]account[/bold {_ACCENT}]",
+            border_style=f"dim {_ACCENT_DEEP}",
+            padding=(0, 1),
+        ))
+        _CONSOLE.print(tbl)
+
+
+# ── /split ─────────────────────────────────────────────────────────────────────
+
+def _cmd_split(conn, user_id: str) -> None:
+    """Show live needs/wants/savings ratios via compute_split."""
+    from tools.split import compute_split
+    from orchestrator.router import _fetch_transactions  # type: ignore[attr-defined]
+
+    txns = _fetch_transactions(conn, user_id, 90)
+    if not txns:
+        _CONSOLE.print(f"[{_DIM_TEXT}]No transactions in the last 90 days.[/{_DIM_TEXT}]")
+        return
+
+    try:
+        s = compute_split(txns)
+    except ValueError as exc:
+        _CONSOLE.print(f"[{_RED}]{exc}[/{_RED}]")
+        return
+
+    def _bar(pct: float, color: str, width: int = 30) -> Text:
+        filled = round(pct / 100 * width)
+        bar = Text()
+        bar.append("█" * filled, style=f"bold {color}")
+        bar.append("░" * (width - filled), style=f"dim {_DIMMER_TEXT}")
+        return bar
+
+    body = Text()
+    body.append("90-day income\n", style=f"dim {_DIM_TEXT}")
+    body.append(f"  CHF {s.income_chf:,.2f}\n\n", style="bold")
+
+    for label, chf, pct, color in [
+        ("Needs   ", s.needs_chf,   s.needs_pct,   _NEED_COLOR),
+        ("Wants   ", s.wants_chf,   s.wants_pct,   _WANT_COLOR),
+        ("Savings ", s.savings_chf, s.savings_pct, _SAVE_COLOR),
+    ]:
+        body.append(f"  {label}", style=f"bold {color}")
+        body.append(f"{pct:5.1f}%  CHF {chf:,.2f}\n", style="")
+        body.append("  ")
+        body.append_text(_bar(pct, color))
+        body.append("\n\n")
+
+    _CONSOLE.print(Panel(
+        body,
+        title=f"[bold {_ACCENT}]split[/bold {_ACCENT}]",
+        border_style=f"dim {_ACCENT_DEEP}",
+        padding=(0, 1),
+    ))
+
+
+# ── /goal ──────────────────────────────────────────────────────────────────────
+
+def _cmd_goal(conn, user_id: str) -> None:
+    """Show the active goal and feasibility."""
+    from tools.feasibility import compute_goal_feasibility
+    from tools.split import compute_split
+    from orchestrator.router import _fetch_transactions, _fetch_savings_total  # type: ignore[attr-defined]
+    from contracts import StructuredGoal
+    from datetime import date
+
+    row = conn.execute(
+        "SELECT id, user_id, goal_type, amount, target_date, engagement, framework, active "
+        "FROM goals WHERE user_id=? AND active=1 ORDER BY created_at DESC LIMIT 1",
+        (user_id,),
+    ).fetchone()
+
+    if not row:
+        _CONSOLE.print(Panel(
+            f"[{_DIM_TEXT}]No active goal. Chat with the agent to set one.[/{_DIM_TEXT}]",
+            title=f"[bold {_ACCENT}]goal[/bold {_ACCENT}]",
+            border_style=f"dim {_ACCENT_DEEP}",
+            padding=(0, 1),
+        ))
+        return
+
+    goal = StructuredGoal(
+        id=row[0], user_id=row[1], goal_type=row[2], amount=row[3],
+        target_date=date.fromisoformat(row[4]) if row[4] else None,
+        engagement=row[5], framework=row[6], active=bool(row[7]),
+    )
+
+    body = Text()
+    body.append("Type         ", style=f"dim {_DIM_TEXT}")
+    body.append(goal.goal_type + "\n", style="bold")
+    if goal.amount:
+        body.append("Target       ", style=f"dim {_DIM_TEXT}")
+        body.append(f"CHF {goal.amount:,.0f}\n", style=f"bold {_GREEN}")
+    if goal.target_date:
+        body.append("By           ", style=f"dim {_DIM_TEXT}")
+        body.append(str(goal.target_date) + "\n", style="bold")
+    body.append("Engagement   ", style=f"dim {_DIM_TEXT}")
+    body.append((goal.engagement or "—") + "\n", style="bold")
+    body.append("Framework    ", style=f"dim {_DIM_TEXT}")
+    body.append((goal.framework or "not set") + "\n", style="bold")
+
+    if goal.goal_type == "target" and goal.amount and goal.target_date:
+        txns = _fetch_transactions(conn, user_id, 90)
+        income = 0.0
+        if txns:
+            try:
+                income = compute_split(txns).income_chf
+            except ValueError:
+                pass
+        current_savings = _fetch_savings_total(conn, user_id)
+        try:
+            f = compute_goal_feasibility(goal, income or 1.0, current_savings)
+            body.append("\n")
+            body.append("Monthly needed ", style=f"dim {_DIM_TEXT}")
+            body.append(f"CHF {f.required_monthly:,.0f}\n", style="bold")
+            body.append("On track       ", style=f"dim {_DIM_TEXT}")
+            if f.on_track:
+                body.append("yes\n", style=f"bold {_GREEN}")
+            else:
+                body.append("no\n", style=f"bold {_RED}")
+        except (ValueError, Exception):
+            pass
+
+    _CONSOLE.print(Panel(
+        body,
+        title=f"[bold {_ACCENT}]goal[/bold {_ACCENT}]",
+        border_style=f"dim {_ACCENT_DEEP}",
+        padding=(0, 1),
+    ))
+
+
+# ── /fire ──────────────────────────────────────────────────────────────────────
+
+def _cmd_fire(args: list[str], bank: DBBankingProvider, conn) -> None:
+    """/fire <amount> <merchant…>  — inject a test transaction."""
+    if len(args) < 2:
+        _CONSOLE.print(
+            f"[{_DIM_TEXT}]Usage: /fire <amount> <merchant>\n"
+            f"  e.g.  /fire -120 Digitec Galaxus[/{_DIM_TEXT}]"
+        )
+        return
+
+    try:
+        amount = float(args[0])
+    except ValueError:
+        _CONSOLE.print(f"[{_RED}]Invalid amount: {args[0]!r}[/{_RED}]")
+        return
+
+    merchant = " ".join(args[1:])
+
+    accounts = bank.get_accounts()
+    if not accounts:
+        _CONSOLE.print(f"[{_RED}]No accounts found.[/{_RED}]")
+        return
+    account_id = accounts[0].id
+
+    from tools.categorize import categorize_transaction
+
+    txn = Transaction(
+        id=f"fire-{uuid.uuid4().hex[:8]}",
+        account_id=account_id,
+        amount=round(amount, 2),
+        currency="CHF",
+        merchant=merchant,
+        category=None,
+        ts=datetime.now(timezone.utc),
+    )
+    txn.category = categorize_transaction(txn)
+
+    bank.fire_transaction(txn)
+
+    sign = "+" if amount >= 0 else ""
+    color = _INCOME_COLOR if amount >= 0 else _RED
+    _CONSOLE.print(Panel(
+        Text.assemble(
+            ("Injected transaction\n\n", f"bold"),
+            ("Merchant   ", f"dim {_DIM_TEXT}"), (merchant + "\n", ""),
+            ("Amount     ", f"dim {_DIM_TEXT}"), (f"{sign}{amount:,.2f} CHF\n", f"bold {color}"),
+            ("Category   ", f"dim {_DIM_TEXT}"), ((txn.category or "—") + "\n", "bold"),
+            ("ID         ", f"dim {_DIM_TEXT}"), (txn.id + "\n", f"dim {_DIMMER_TEXT}"),
+        ),
+        title=f"[bold {_ACCENT}]fire[/bold {_ACCENT}]",
+        border_style=f"dim {_ACCENT_DEEP}",
+        padding=(0, 1),
+    ))
+
+
 # ── Agent response ─────────────────────────────────────────────────────────────
 
 def _render_response(text: str) -> None:
-    """Render the agent's plain-text response in a styled panel.
-
-    Switches to rich Markdown rendering when the response contains markdown
-    syntax (headers, bold, fenced code, tables, bullet lists).
-    """
     md_markers = ("```", "**", "##", "\n- ", "\n* ", "| --", "---\n")
     content = Markdown(text) if any(m in text for m in md_markers) else text
 
@@ -201,6 +484,55 @@ def _seed_demo_data(conn) -> None:
     conn.commit()
 
 
+# ── Onboarding detection ───────────────────────────────────────────────────────
+
+def _is_first_run(conn, user_id: str) -> bool:
+    """Return True if the user has no active goal (= has not completed onboarding)."""
+    row = conn.execute(
+        "SELECT 1 FROM goals WHERE user_id=? AND active=1 LIMIT 1",
+        (user_id,),
+    ).fetchone()
+    return row is None
+
+
+def _run_onboarding(llm, conn, bank: DBBankingProvider) -> None:
+    """Kick off the goal_intake skill and hand control to the user."""
+    _CONSOLE.print(Panel(
+        Text.assemble(
+            ("Welcome to Lucid Agent!\n\n", f"bold {_ACCENT}"),
+            (
+                "It looks like this is your first time here.\n"
+                "I'll help you define a financial goal and build a budget\n"
+                "that actually fits your life in Switzerland.\n\n",
+                "",
+            ),
+            ("Let's get started.", f"dim {_DIM_TEXT}"),
+        ),
+        title=f"[bold {_ACCENT}]onboarding[/bold {_ACCENT}]",
+        border_style=f"dim {_ACCENT_DEEP}",
+        padding=(1, 2),
+    ))
+
+    # Kick the agent — the goal_intake skill takes it from here
+    _CONSOLE.print()
+    with _CONSOLE.status(
+        f"[{_DIM_TEXT}]thinking…[/{_DIM_TEXT}]",
+        spinner="dots",
+        spinner_style=_ACCENT,
+    ):
+        response = handle_message(
+            llm=llm,
+            conn=conn,
+            user_id=_USER_ID,
+            conversation_id=_CONV_ID,
+            user_message=(
+                "Hi, I'm a new user and I'd like to set a financial goal "
+                "and get started with budgeting."
+            ),
+        )
+    _render_response(response)
+
+
 # ── REPL loop ──────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -208,7 +540,6 @@ def main() -> None:
 
     _render_banner()
 
-    # Provider selection: CLI arg → auto-detect → interactive wizard
     llm = build_adapter(model_override)
     _CONSOLE.print(
         f"[{_DIMMER_TEXT}]provider: {llm.model}[/{_DIMMER_TEXT}]\n",
@@ -217,6 +548,24 @@ def main() -> None:
 
     conn = init_db(":memory:")
     _seed_demo_data(conn)
+
+    # BankingProvider — wired here; repl.py never touches SimulatedBank directly
+    bank: DBBankingProvider = make_db_provider(conn, _USER_ID)  # type: ignore[assignment]
+
+    # First-run onboarding — route into the goal_intake skill, not scripted here
+    if _is_first_run(conn, _USER_ID):
+        _run_onboarding(llm, conn, bank)
+
+    else:
+        # Returning user — quick greeting
+        _CONSOLE.print(
+            Panel(
+                f"[{_DIM_TEXT}]Welcome back. Your account and goals are loaded. "
+                f"Type [bold {_ACCENT}]/help[/bold {_ACCENT}] for commands.[/{_DIM_TEXT}]",
+                border_style=f"dim {_ACCENT_DEEP}",
+                padding=(0, 1),
+            )
+        )
 
     while True:
         try:
@@ -233,15 +582,35 @@ def main() -> None:
 
         # ── Slash commands ─────────────────────────────────────────────────────
         if user_input.startswith("/"):
-            cmd = user_input.split()[0].lower()
+            parts = user_input.split()
+            cmd = parts[0].lower()
+
             if cmd in {"/quit", "/exit", "/q"}:
                 _CONSOLE.print(f"[{_DIM_TEXT}]Goodbye.[/{_DIM_TEXT}]")
                 break
+
             elif cmd == "/help":
                 _render_help()
+
             elif cmd == "/clear":
                 _CONSOLE.clear()
                 _render_banner()
+
+            elif cmd == "/model":
+                llm = _cmd_model(llm)
+
+            elif cmd == "/account":
+                _cmd_account(bank)
+
+            elif cmd == "/split":
+                _cmd_split(conn, _USER_ID)
+
+            elif cmd == "/goal":
+                _cmd_goal(conn, _USER_ID)
+
+            elif cmd == "/fire":
+                _cmd_fire(parts[1:], bank, conn)
+
             else:
                 _CONSOLE.print(
                     f"[{_DIM_TEXT}]Unknown command: "

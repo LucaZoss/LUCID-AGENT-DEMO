@@ -24,5 +24,8 @@ dev    = ["pytest>=7.0"]
 testpaths = ["tests"]
 pythonpath = ["."]
 
+[tool.setuptools]
+py-modules = ["contracts"]
+
 [tool.setuptools.packages.find]
 include = ["bank*", "db*", "llm*", "orchestrator*", "skills*", "tools*"]
