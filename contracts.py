@@ -21,6 +21,9 @@ class Transaction:
     merchant: str
     category: str | None  # 'need' | 'want' | 'savings' — set by categorizer
     ts: datetime
+    line_category: str | None = None  # fine label: rent, groceries, …
+    import_batch_id: str | None = None
+    external_fingerprint: str | None = None  # CSV dedupe key
 
 
 @dataclass

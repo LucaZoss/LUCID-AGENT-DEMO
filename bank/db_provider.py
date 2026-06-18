@@ -43,15 +43,17 @@ class DBBankingProvider(BankingProvider):
     def get_transactions(self, account_id: str, days: int = 90) -> list[Transaction]:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
         rows = self._conn.execute(
-            "SELECT id, account_id, amount, currency, merchant, category, ts "
+            "SELECT id, account_id, amount, currency, merchant, category, "
+            "line_category, ts, import_batch_id, external_fingerprint "
             "FROM transactions WHERE account_id=? AND ts >= ? ORDER BY ts DESC",
             (account_id, cutoff),
         ).fetchall()
         return [
             Transaction(
                 id=r[0], account_id=r[1], amount=r[2], currency=r[3],
-                merchant=r[4], category=r[5],
-                ts=datetime.fromisoformat(r[6]),
+                merchant=r[4], category=r[5], line_category=r[6],
+                ts=datetime.fromisoformat(r[7]),
+                import_batch_id=r[8], external_fingerprint=r[9],
             )
             for r in rows
         ]
@@ -67,10 +69,14 @@ class DBBankingProvider(BankingProvider):
         """
         self._conn.execute(
             "INSERT OR IGNORE INTO transactions"
-            "(id, account_id, amount, currency, merchant, category, ts) "
-            "VALUES(?,?,?,?,?,?,?)",
-            (txn.id, txn.account_id, txn.amount, txn.currency,
-             txn.merchant, txn.category, txn.ts.isoformat()),
+            "(id, account_id, amount, currency, merchant, category, line_category, "
+            "ts, import_batch_id, external_fingerprint) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                txn.id, txn.account_id, txn.amount, txn.currency,
+                txn.merchant, txn.category, txn.line_category,
+                txn.ts.isoformat(), txn.import_batch_id, txn.external_fingerprint,
+            ),
         )
         self._conn.execute(
             "UPDATE accounts SET balance = balance + ? WHERE id=?",

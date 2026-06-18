@@ -24,8 +24,14 @@ amounts are negative for outflows.
   - *Tools* = pure deterministic Python functions (categorize, compute, fetch).
   - *Skills* (SKILL.md) = LLM judgment / multi-step procedures (goal intake,
     framework choice, explanation).
-
----
+- **CSV ingest** (`ingest/`) = deterministic parsing, column auto-detect, mapping
+  profiles, import batches, dedupe fingerprints, and balance reconciliation. Not
+  a second `BankingProvider` — it writes the same SQLite `transactions` rows the
+  demo seed uses.
+- **Ledger categorization agent** (`agents/ledger_categorizer.py`) = a **second**
+  small LLM loop with its own tools (`propose_spending_bucket`, `propose_line_category`).
+  It does **not** use `orchestrator/router.py` or budgeting skills. Proposals land
+  in `category_proposals` until the user applies them via the REPL (`/cat-accept`).
 
 ## How the router uses SKILL.md (two-stage / lazy loading)
 

@@ -7,11 +7,15 @@ Maps directly onto the four memory layers from CLAUDE.md:
   3. Conversational mem   -> conversations, messages, conversation_summary
   4. Soft (learned) prefs -> learned_preferences
   + notification state    -> pending_notifications
+  + CSV import            -> csv_mapping_profiles, import_batches
+  + categorization HIL    -> category_proposals, merchant_category_overrides
 
 SQLite for the demo (file-based, zero setup). The column shapes are what
 matter; swap to Postgres later without touching the rest of the app.
 Authoritative state lives HERE; the LLM context is assembled from these rows.
 """
+
+from __future__ import annotations
 
 import sqlite3
 
@@ -55,6 +59,37 @@ CREATE TABLE IF NOT EXISTS prefs (
     persona         TEXT DEFAULT 'neutral'  -- 'neutral' | 'coach'
 );
 
+-- CSV column mapping profiles (durable, user-editable)
+CREATE TABLE IF NOT EXISTS csv_mapping_profiles (
+    id              TEXT PRIMARY KEY,
+    user_id         TEXT NOT NULL REFERENCES users(id),
+    display_name    TEXT NOT NULL,
+    column_map      TEXT NOT NULL,    -- JSON: lucid_field -> csv header name
+    sign_rule       TEXT,             -- JSON: single_amount | debit_credit | etc.
+    encoding        TEXT DEFAULT 'utf-8-sig',
+    delimiter       TEXT DEFAULT ',',
+    header_hash     TEXT,             -- sha256 of normalized header row for match
+    is_default      INTEGER DEFAULT 0,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_csv_profile_user ON csv_mapping_profiles(user_id);
+CREATE INDEX IF NOT EXISTS idx_csv_profile_header ON csv_mapping_profiles(user_id, header_hash);
+
+-- One row per import run / file
+CREATE TABLE IF NOT EXISTS import_batches (
+    id              TEXT PRIMARY KEY,
+    user_id         TEXT NOT NULL REFERENCES users(id),
+    source_path     TEXT NOT NULL,
+    content_sha256  TEXT NOT NULL,
+    mapping_profile_id TEXT REFERENCES csv_mapping_profiles(id),
+    imported_at     TEXT NOT NULL,
+    row_count       INTEGER NOT NULL DEFAULT 0,
+    skipped_duplicate_count INTEGER NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL DEFAULT 'completed'  -- completed|partial|rolled_back
+);
+CREATE INDEX IF NOT EXISTS idx_import_batches_user_path ON import_batches(user_id, source_path);
+
 -- ── Layer 2: financial history (ledger) ────────────────────────────────────
 CREATE TABLE IF NOT EXISTS accounts (
     id              TEXT PRIMARY KEY,
@@ -71,9 +106,38 @@ CREATE TABLE IF NOT EXISTS transactions (
     currency        TEXT NOT NULL DEFAULT 'CHF',
     merchant        TEXT NOT NULL,
     category        TEXT,             -- need|want|savings, set by categorizer
-    ts              TEXT NOT NULL
+    line_category   TEXT,            -- rent|groceries|… (optional fine label)
+    ts              TEXT NOT NULL,
+    import_batch_id TEXT REFERENCES import_batches(id),
+    external_fingerprint TEXT       -- dedupe key for CSV imports
 );
 CREATE INDEX IF NOT EXISTS idx_txn_account_ts ON transactions(account_id, ts);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_txn_fingerprint
+    ON transactions(account_id, external_fingerprint)
+    WHERE external_fingerprint IS NOT NULL;
+
+-- Ledger categorization agent — proposals only until HIL commit
+CREATE TABLE IF NOT EXISTS category_proposals (
+    id              TEXT PRIMARY KEY,
+    user_id         TEXT NOT NULL REFERENCES users(id),
+    txn_id          TEXT NOT NULL REFERENCES transactions(id),
+    proposed_bucket TEXT,             -- need|want|savings
+    proposed_line   TEXT,             -- closed vocabulary line label
+    rationale       TEXT,
+    status          TEXT NOT NULL DEFAULT 'pending',  -- pending|accepted|rejected
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cat_prop_user_status ON category_proposals(user_id, status);
+
+CREATE TABLE IF NOT EXISTS merchant_category_overrides (
+    id                  TEXT PRIMARY KEY,
+    user_id             TEXT NOT NULL REFERENCES users(id),
+    merchant_normalized TEXT NOT NULL,
+    bucket              TEXT,         -- need|want|savings
+    line_category       TEXT,
+    updated_at          TEXT NOT NULL,
+    UNIQUE(user_id, merchant_normalized)
+);
 
 -- periodic snapshots so the dashboard can chart progress over time
 CREATE TABLE IF NOT EXISTS split_snapshots (
@@ -138,9 +202,35 @@ CREATE TABLE IF NOT EXISTS pending_notifications (
 """
 
 
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    return {row[1] for row in cur.fetchall()}
+
+
+def migrate_schema(conn: sqlite3.Connection) -> None:
+    """Apply additive migrations for DBs created before ingest / HIL tables."""
+    # New standalone tables (CREATE IF NOT EXISTS already ran in SCHEMA)
+    cols = _table_columns(conn, "transactions")
+    if "line_category" not in cols:
+        conn.execute("ALTER TABLE transactions ADD COLUMN line_category TEXT")
+    if "import_batch_id" not in cols:
+        conn.execute("ALTER TABLE transactions ADD COLUMN import_batch_id TEXT")
+    if "external_fingerprint" not in cols:
+        conn.execute(
+            "ALTER TABLE transactions ADD COLUMN external_fingerprint TEXT"
+        )
+    # Partial unique index (may fail on very old SQLite — ignore if exists)
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_txn_fingerprint "
+        "ON transactions(account_id, external_fingerprint) "
+        "WHERE external_fingerprint IS NOT NULL"
+    )
+
+
 def init_db(path: str = "finance_agent.db") -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.executescript(SCHEMA)
+    migrate_schema(conn)
     conn.commit()
     return conn
 

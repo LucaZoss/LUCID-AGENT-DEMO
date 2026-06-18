@@ -28,4 +28,4 @@ pythonpath = ["."]
 py-modules = ["contracts"]
 
 [tool.setuptools.packages.find]
-include = ["bank*", "db*", "llm*", "orchestrator*", "skills*", "tools*"]
+include = ["bank*", "db*", "llm*", "orchestrator*", "skills*", "tools*", "ingest*", "agents*"]

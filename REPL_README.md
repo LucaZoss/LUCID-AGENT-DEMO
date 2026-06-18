@@ -222,20 +222,60 @@ each followed by a pass / fail banner-terms check.
 ## Run the test suite
 
 ```bash
-uv run pytest -q        # 89 tests, all offline, no API key needed
+uv run pytest -q        # offline; no API key needed
+```
+
+---
+
+## CSV import and mapping profiles
+
+Use **`/setup`** in the REPL anytime for a concise checklist (import folder, `LUCID_DB_PATH`, `LUCID_LEDGER`, and which slash commands to run). It shows the resolved import folder and your current environment values.
+
+Drop one or more bank **CSV** files into `data/imports/` (or set **`LUCID_IMPORT_DIR`** to another folder). The REPL auto-detects common Swiss / English column headers, deduplicates rows by a stable fingerprint, and reconciles the account balance from the sum of all transactions.
+
+| Environment variable | Purpose |
+|----------------------|---------|
+| `LUCID_IMPORT_DIR` | Directory scanned for `*.csv` (default: `data/imports`) |
+| `LUCID_DB_PATH` | SQLite database file path. Default is **`:memory:`** — mapping profiles and imported rows are **not** kept after exit. Set to e.g. `lucid_demo.db` to persist. |
+| `LUCID_LEDGER` | `demo` (default): seed demo transactions. `import`: empty ledger + same user/account row for CSV-only workflows. |
+
+**Slash commands**
+
+| Command | Action |
+|---------|--------|
+| `/setup` | Step-by-step help for CSV import, persistence (`LUCID_DB_PATH`), and categorization commands |
+| `/import` | Import every `*.csv` in the import directory (optional: `profile <uuid>`; `force` / `--force` to re-read an unchanged file) |
+| `/import preview <file.csv>` | Show headers, detected column mapping, and sample rows |
+| `/import-preview <file.csv>` | Same as `/import preview` |
+| `/import-rollback <batch_id>` | Delete transactions from one import batch (id printed after `/import`) |
+| `/import-mapping list` | List saved mapping profiles |
+| `/import-mapping save <name>` | Save the mapping from the last `/import-preview` |
+| `/import-mapping set-default <id>` | Mark a profile as default for the user |
+| `/cat-run` | Run the **ledger categorization** LLM (separate from the budgeting agent) to queue proposals |
+| `/review-categories` | List pending bucket/line proposals + deterministic `need/want/savings` hint |
+| `/cat-accept <proposal_id> [bucket need] [line groceries]` | Apply a proposal (optional overrides) |
+| `/cat-reject <proposal_id>` | Reject a proposal |
+
+Non-interactive preview:
+
+```bash
+uv run python -m ingest.cli path/to/export.csv
 ```
 
 ---
 
 ## Session persistence
 
-Each launch creates a fresh **in-memory** database. To persist the session
-across restarts, change one line in [orchestrator/repl.py](orchestrator/repl.py):
+By default the REPL uses **`LUCID_DB_PATH=:memory:`** (or unset). Mapping profiles, import batches, and CSV-imported transactions disappear when you exit. Type **`/setup`** in the REPL for a reminder and example shell commands.
 
-```python
-# line ~80 — change ":memory:" to a file path
-conn = init_db("lucid_demo.db")
+To persist across restarts, set a file path:
+
+```bash
+export LUCID_DB_PATH=lucid_demo.db
+uv run lucid-agent
 ```
+
+You can still override in code, but the environment variable is the supported switch (see [orchestrator/repl.py](orchestrator/repl.py)).
 
 ---
 
@@ -257,6 +297,8 @@ LUCID-AGENT-DEMO/
 │   ├── provider.py        ← LLMProvider interface
 │   ├── config.py          ← auto-detect + wizard
 │   └── adapters/litellm_adapter.py
+├── ingest/                ← deterministic CSV import + mapping profiles
+├── agents/                ← ledger categorization LLM loop (not the budgeting router)
 ├── tools/                 ← deterministic tools (no LLM)
 ├── bank/                  ← BankingProvider + SimulatedBank
 ├── db/db_schema.py

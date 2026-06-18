@@ -18,9 +18,13 @@ Run:
 
 from __future__ import annotations
 
+import os
+import sqlite3
 import sys
 import uuid
 from datetime import datetime, timedelta, timezone
+
+from pathlib import Path
 
 import pyfiglet
 from rich.console import Console
@@ -37,10 +41,24 @@ from db.db_schema import init_db
 from llm.config import build_adapter, reconfigure_adapter
 from orchestrator.router import handle_message
 
+from agents.ledger_categorizer import run_ledger_categorizer
+from agents import ledger_tools
+from ingest.csv_detect import MappingAmbiguity, ResolvedColumnMapping
+from ingest.importer import (
+    ImportResult,
+    import_csv_files,
+    preview_csv_file,
+    rollback_import_batch,
+)
+from ingest import profiles
+
 # ── Session constants ──────────────────────────────────────────────────────────
 
 _USER_ID = "demo-user-1"
 _CONV_ID  = "demo-conv-1"
+
+# Last `/import-preview` result — used by `/import-mapping save`
+_PENDING_CSV_PREVIEW: dict | None = None
 
 # ── Color palette ──────────────────────────────────────────────────────────────
 
@@ -129,6 +147,7 @@ def _render_banner() -> None:
     _CONSOLE.print(
         f"[{_DIMMER_TEXT}]type "
         f"[bold {_ACCENT}]/help[/bold {_ACCENT}] for commands · "
+        f"[bold {_ACCENT}]/setup[/bold {_ACCENT}] for CSV & persistence · "
         f"[bold {_ACCENT}]/quit[/bold {_ACCENT}] to exit"
         f"[/{_DIMMER_TEXT}]",
         justify="center",
@@ -144,11 +163,19 @@ def _render_help() -> None:
     body.append("Commands\n\n", style="bold")
     commands = [
         ("/help             ", "show this message"),
+        ("/setup            ", "CSV import & persistence checklist (env + REPL steps)"),
         ("/model            ", "configure LLM provider or API key"),
         ("/account          ", "show account balance and last 10 transactions"),
         ("/split            ", "show your live needs / wants / savings ratios"),
         ("/goal             ", "show your active goal and feasibility"),
-        ("/fire <amt> <mer> ", "inject a test transaction (negative = outflow)"),
+        ("/import              ", "import all *.csv from LUCID_IMPORT_DIR (see REPL_README)"),
+        ("/import preview <f>  ", "preview headers + auto-detect mapping"),
+        ("/import-rollback <id>", "remove transactions from an import batch"),
+        ("/import-mapping …    ", "list | save <name> | set-default <profile_id>"),
+        ("/review-categories   ", "show pending bucket/line proposals + deterministic hint"),
+        ("/cat-run             ", "run ledger categorizer LLM on uncategorized outflows"),
+        ("/cat-accept <id> …   ", "accept proposal; optional: bucket need line groceries"),
+        ("/cat-reject <id>     ", "reject a pending proposal"),
         ("/clear            ", "clear the screen (session continues)"),
         ("/quit             ", "exit"),
     ]
@@ -484,7 +511,97 @@ def _seed_demo_data(conn) -> None:
     conn.commit()
 
 
-# ── Onboarding detection ───────────────────────────────────────────────────────
+def _seed_minimal_user(conn) -> None:
+    """User + empty account for CSV import mode (no demo transactions)."""
+    now = datetime.now()
+    account_id = "demo-account-1"
+    conn.execute(
+        "INSERT OR IGNORE INTO users(id, display_name, created_at) VALUES(?,?,?)",
+        (_USER_ID, "Import User", now.isoformat()),
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO accounts(id, user_id, name, balance, currency) "
+        "VALUES(?,?,?,?,?)",
+        (account_id, _USER_ID, "Imported ledger", 0.0, "CHF"),
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO conversations(id, user_id, started_at) VALUES(?,?,?)",
+        (_CONV_ID, _USER_ID, now.isoformat()),
+    )
+    conn.execute("INSERT OR IGNORE INTO prefs(user_id) VALUES(?)", (_USER_ID,))
+    conn.commit()
+
+
+def _import_dir() -> Path:
+    """Directory scanned for ``/import`` (override with ``LUCID_IMPORT_DIR``)."""
+    p = os.environ.get("LUCID_IMPORT_DIR", "data/imports")
+    d = Path(p)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _render_setup_help() -> None:
+    """Print a step-by-step checklist for CSV import and a persistent SQLite DB."""
+    imp = _import_dir().resolve()
+    db_raw = os.environ.get("LUCID_DB_PATH")
+    db_disp = db_raw if db_raw else ":memory: (default — data not saved after exit)"
+    ledger = os.environ.get("LUCID_LEDGER", "demo")
+
+    body = Text()
+    body.append("Getting started with your own CSV data\n\n", style="bold")
+    body.append("1. Put bank CSV files in this folder:\n   ", style="")
+    body.append(str(imp), style=f"bold {_ACCENT}")
+    body.append(
+        "\n   Or set LUCID_IMPORT_DIR to another path before starting the REPL.\n\n",
+        style=f"dim {_DIM_TEXT}",
+    )
+    body.append("2. Optional — start with an empty ledger (no demo transactions):\n   ", style="")
+    body.append("LUCID_LEDGER=import", style="bold")
+    body.append(" then restart the REPL.\n\n", style="")
+
+    body.append("3. Persist imports & mapping profiles across sessions:\n   ", style="")
+    body.append("Set LUCID_DB_PATH", style="bold")
+    body.append(
+        " to a SQLite file, e.g. lucid_demo.db, in the environment before launch.\n"
+        "   The REPL reads ",
+        style="",
+    )
+    body.append("os.environ", style="bold")
+    body.append(
+        " only — a line in .env is not loaded automatically unless your shell or IDE loads it.\n"
+        "   PowerShell:  ",
+        style=f"dim {_DIM_TEXT}",
+    )
+    body.append('$env:LUCID_DB_PATH="lucid_demo.db"', style="bold")
+    body.append("\n   bash:         ", style=f"dim {_DIM_TEXT}")
+    body.append("export LUCID_DB_PATH=./lucid_demo.db\n\n", style="bold")
+
+    body.append("4. In the REPL:\n   ", style="")
+    body.append("/import-preview yourfile.csv", style=f"bold {_ACCENT}")
+    body.append(" — verify column detection\n   ", style="")
+    body.append("/import-mapping save MyBank", style=f"bold {_ACCENT}")
+    body.append(" — save mapping after a good preview\n   ", style="")
+    body.append("/import", style=f"bold {_ACCENT}")
+    body.append(" — import all *.csv from the import folder\n   ", style="")
+    body.append("/cat-run", style=f"bold {_ACCENT}")
+    body.append(" → ", style="")
+    body.append("/review-categories", style=f"bold {_ACCENT}")
+    body.append(" → ", style="")
+    body.append("/cat-accept …", style=f"bold {_ACCENT}")
+    body.append(" for LLM proposals (needs API key).\n\n", style="")
+
+    body.append("Current environment\n", style=f"dim {_DIM_TEXT}")
+    body.append(f"  import folder  → {imp}\n", style="")
+    body.append(f"  LUCID_DB_PATH   → {db_disp}\n", style="")
+    body.append(f"  LUCID_LEDGER    → {ledger}\n", style="")
+
+    _CONSOLE.print(Panel(
+        body,
+        title=f"[bold {_ACCENT}]setup[/bold {_ACCENT}]",
+        border_style=f"dim {_ACCENT_DEEP}",
+        padding=(0, 1),
+    ))
+
 
 def _is_first_run(conn, user_id: str) -> bool:
     """Return True if the user has no active goal (= has not completed onboarding)."""
@@ -533,6 +650,233 @@ def _run_onboarding(llm, conn, bank: DBBankingProvider) -> None:
     _render_response(response)
 
 
+# ── CSV import & ledger categorization (REPL glue) ─────────────────────────────
+
+
+def _cmd_import_run(conn: sqlite3.Connection, bank: DBBankingProvider, parts: list[str]) -> None:
+    """Import all ``*.csv`` from ``LUCID_IMPORT_DIR``."""
+    force = any(p in ("--force", "force") for p in parts)
+    d = _import_dir()
+    csvs = sorted(d.glob("*.csv"))
+    if not csvs:
+        _CONSOLE.print(
+            f"[{_DIM_TEXT}]No CSV files in {d.resolve()}. "
+            f"Drop exports there or set LUCID_IMPORT_DIR.[/{_DIM_TEXT}]"
+        )
+        return
+    accounts = bank.get_accounts()
+    if not accounts:
+        _CONSOLE.print(f"[{_RED}]No account to import into.[/{_RED}]")
+        return
+    acc_id = accounts[0].id
+    profile_id: str | None = None
+    for i, p in enumerate(parts):
+        if p == "profile" and i + 1 < len(parts):
+            profile_id = parts[i + 1]
+            break
+    results = import_csv_files(
+        conn, _USER_ID, acc_id, csvs, profile_id=profile_id, force_reimport=force,
+    )
+    for r in results:
+        body = (
+            f"[bold]{r.path}[/bold]\n"
+            f"  skipped: {r.skipped}  message: {r.message}\n"
+        )
+        if r.batch_id:
+            body += (
+                f"  batch_id: {r.batch_id}\n"
+                f"  inserted: {r.rows_inserted}  dup_skips: {r.rows_skipped_duplicate} "
+                f"invalid: {r.rows_skipped_invalid}\n"
+            )
+        for w in r.warnings:
+            body += f"  [{_AMBER}]warn[/{_AMBER}] {w}\n"
+        _CONSOLE.print(Panel(body.rstrip(), title="import", border_style=_ACCENT_DEEP))
+
+
+def _cmd_import_preview(parts: list[str]) -> None:
+    """Preview detection + sample rows for one file in the import directory."""
+    global _PENDING_CSV_PREVIEW
+    if len(parts) < 3:
+        _CONSOLE.print(
+            f"[{_DIM_TEXT}]Usage: /import-preview <filename.csv>[/{_DIM_TEXT}]"
+        )
+        return
+    name = parts[2]
+    path = _import_dir() / name
+    if not path.is_file():
+        _CONSOLE.print(f"[{_RED}]File not found: {path}[/{_RED}]")
+        return
+    prev = preview_csv_file(path)
+    _PENDING_CSV_PREVIEW = {"path": str(path), "preview": prev}
+    det = prev["detection"]
+    tbl = Table(title="sample rows", box=None)
+    if prev["sample_rows"]:
+        keys = list(prev["sample_rows"][0].keys())
+        for k in keys:
+            tbl.add_column(k[:20], overflow="fold")
+        for row in prev["sample_rows"]:
+            tbl.add_row(*(row.get(k, "")[:80] for k in keys))
+    msg = (
+        f"path: {prev['path']}\nencoding: {prev['encoding']}  delimiter: {prev['delimiter']!r}\n"
+        f"header_hash: {prev['header_hash']}\n"
+    )
+    if isinstance(det, MappingAmbiguity):
+        msg += f"\n[{_RED}]mapping: {det.message}[/{_RED}]"
+    else:
+        msg += f"\n[{_GREEN}]mapping OK[/{_GREEN}] sign_rule={det.sign_rule}\n"
+        msg += "columns: " + ", ".join(f"{k}→{v}" for k, v in det.column_map.items())
+    _CONSOLE.print(Panel(msg, title="import-preview", border_style=_ACCENT_DEEP))
+    if prev["sample_rows"]:
+        _CONSOLE.print(tbl)
+
+
+def _cmd_import_rollback(conn: sqlite3.Connection, bank: DBBankingProvider, parts: list[str]) -> None:
+    if len(parts) < 2:
+        _CONSOLE.print(f"[{_DIM_TEXT}]Usage: /import-rollback <batch_id>[/{_DIM_TEXT}]")
+        return
+    bid = parts[1]
+    acc = bank.get_accounts()[0].id
+    ok, msg = rollback_import_batch(conn, _USER_ID, acc, bid)
+    color = _GREEN if ok else _RED
+    _CONSOLE.print(f"[{color}]{msg}[/{color}]")
+
+
+def _cmd_import_mapping(conn: sqlite3.Connection, parts: list[str]) -> None:
+    global _PENDING_CSV_PREVIEW
+    sub = (parts[1] if len(parts) > 1 else "list").lower()
+    if sub == "list":
+        rows = profiles.list_profiles(conn, _USER_ID)
+        if not rows:
+            _CONSOLE.print(f"[{_DIM_TEXT}]No saved mapping profiles.[/{_DIM_TEXT}]")
+            return
+        t = Table(box=None)
+        t.add_column("id")
+        t.add_column("name")
+        t.add_column("default")
+        for r in rows:
+            t.add_row(r["id"][:8] + "…", r["display_name"], "yes" if r["is_default"] else "")
+        _CONSOLE.print(Panel(t, title="mapping profiles", border_style=_ACCENT_DEEP))
+    elif sub == "save" and len(parts) >= 3:
+        if not _PENDING_CSV_PREVIEW:
+            _CONSOLE.print(
+                f"[{_RED}]Run /import-preview <file> first to capture a mapping.[/{_RED}]"
+            )
+            return
+        pr = _PENDING_CSV_PREVIEW["preview"]
+        det = pr["detection"]
+        if isinstance(det, MappingAmbiguity):
+            _CONSOLE.print(f"[{_RED}]Last preview has ambiguous mapping — fix CSV or columns.[/{_RED}]")
+            return
+        assert isinstance(det, ResolvedColumnMapping)
+        name = " ".join(parts[2:])
+        pid = profiles.save_profile(
+            conn,
+            _USER_ID,
+            name,
+            det.column_map,
+            sign_rule=det.sign_rule,
+            encoding=det.encoding,
+            delimiter=det.delimiter,
+            headers=pr["headers"],
+        )
+        _CONSOLE.print(f"[{_GREEN}]Saved profile {pid} as {name!r}[/{_GREEN}]")
+    elif sub == "set-default" and len(parts) >= 3:
+        profiles.set_default_profile(conn, _USER_ID, parts[2])
+        _CONSOLE.print(f"[{_GREEN}]Default profile updated.[/{_GREEN}]")
+    else:
+        _CONSOLE.print(
+            f"[{_DIM_TEXT}]Usage: /import-mapping list | save <name> | "
+            f"set-default <profile_id>[/{_DIM_TEXT}]"
+        )
+
+
+def _cmd_review_categories(conn: sqlite3.Connection) -> None:
+    from tools.categorize import categorize_transaction
+
+    pending = ledger_tools.list_pending_proposals(conn, _USER_ID, 40)
+    if not pending:
+        _CONSOLE.print(f"[{_DIM_TEXT}]No pending category proposals.[/{_DIM_TEXT}]")
+        return
+    t = Table(box=None, show_lines=True)
+    t.add_column("proposal_id", max_width=14, overflow="fold")
+    t.add_column("txn_id", max_width=14, overflow="fold")
+    t.add_column("merchant", max_width=24, overflow="fold")
+    t.add_column("amt")
+    t.add_column("bucket")
+    t.add_column("line")
+    t.add_column("det.need")
+    for p in pending:
+        dummy = Transaction(
+            id=p["txn_id"],
+            account_id="x",
+            amount=float(p["amount"]),
+            currency="CHF",
+            merchant=p["merchant"],
+            category=None,
+            ts=datetime.now(timezone.utc),
+        )
+        det = categorize_transaction(dummy)
+        t.add_row(
+            p["proposal_id"][:12] + "…",
+            p["txn_id"][:12] + "…",
+            p["merchant"],
+            f"{p['amount']:.2f}",
+            p["proposed_bucket"] or "—",
+            p["proposed_line"] or "—",
+            det,
+        )
+    _CONSOLE.print(
+        Panel(
+            t,
+            title="pending proposals (/cat-accept <id> [bucket] [line] | /cat-reject <id>)",
+            border_style=_ACCENT_DEEP,
+        )
+    )
+
+
+def _cmd_cat_accept(conn: sqlite3.Connection, parts: list[str]) -> None:
+    if len(parts) < 2:
+        _CONSOLE.print(
+            f"[{_DIM_TEXT}]Usage: /cat-accept <proposal_id> [bucket need] [line groceries][/{_DIM_TEXT}]"
+        )
+        return
+    pid = parts[1]
+    bucket_o: str | None = None
+    line_o: str | None = None
+    # optional: /cat-accept pid bucket need line groceries
+    if "bucket" in parts:
+        i = parts.index("bucket")
+        if i + 1 < len(parts):
+            bucket_o = parts[i + 1]
+    if "line" in parts:
+        i = parts.index("line")
+        if i + 1 < len(parts):
+            line_o = parts[i + 1]
+    res = ledger_tools.apply_proposal(
+        conn, _USER_ID, pid, bucket_override=bucket_o, line_override=line_o,
+    )
+    if res.get("ok"):
+        _CONSOLE.print(f"[{_GREEN}]Applied: {res}[/{_GREEN}]")
+    else:
+        _CONSOLE.print(f"[{_RED}]{res}[/{_RED}]")
+
+
+def _cmd_cat_reject(conn: sqlite3.Connection, parts: list[str]) -> None:
+    if len(parts) < 2:
+        _CONSOLE.print(f"[{_DIM_TEXT}]Usage: /cat-reject <proposal_id>[/{_DIM_TEXT}]")
+        return
+    ok = ledger_tools.reject_proposal(conn, _USER_ID, parts[1])
+    _CONSOLE.print(
+        f"[{_GREEN if ok else _RED}]rejected={ok}[/{_GREEN if ok else _RED}]"
+    )
+
+
+def _cmd_cat_run(conn: sqlite3.Connection, llm) -> None:
+    with _CONSOLE.status("ledger categorizer…", spinner="dots", spinner_style=_ACCENT):
+        out = run_ledger_categorizer(llm, conn, _USER_ID)
+    _CONSOLE.print(Panel(out, title="ledger categorizer", border_style=_ACCENT_DEEP))
+
+
 # ── REPL loop ──────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -546,8 +890,19 @@ def main() -> None:
         justify="center",
     )
 
-    conn = init_db(":memory:")
-    _seed_demo_data(conn)
+    db_path = os.environ.get("LUCID_DB_PATH", ":memory:")
+    conn = init_db(db_path)
+    if db_path == ":memory:":
+        _CONSOLE.print(
+            f"[{_AMBER}]Note:[/{_AMBER}] [{_DIM_TEXT}]In-memory DB — mapping profiles and "
+            f"CSV imports are lost when you exit. Set [bold]LUCID_DB_PATH[/bold] to persist."
+            f"[/{_DIM_TEXT}]"
+        )
+    ledger_mode = os.environ.get("LUCID_LEDGER", "demo").lower()
+    if ledger_mode == "import":
+        _seed_minimal_user(conn)
+    else:
+        _seed_demo_data(conn)
 
     # BankingProvider — wired here; repl.py never touches SimulatedBank directly
     bank: DBBankingProvider = make_db_provider(conn, _USER_ID)  # type: ignore[assignment]
@@ -592,6 +947,9 @@ def main() -> None:
             elif cmd == "/help":
                 _render_help()
 
+            elif cmd == "/setup":
+                _render_setup_help()
+
             elif cmd == "/clear":
                 _CONSOLE.clear()
                 _render_banner()
@@ -610,6 +968,34 @@ def main() -> None:
 
             elif cmd == "/fire":
                 _cmd_fire(parts[1:], bank, conn)
+
+            elif cmd == "/import":
+                sub = parts[1].lower() if len(parts) > 1 else "run"
+                if sub == "preview":
+                    _cmd_import_preview(parts)
+                else:
+                    _cmd_import_run(conn, bank, parts)
+
+            elif cmd == "/import-preview" and len(parts) >= 2:
+                _cmd_import_preview(["/import", "preview", parts[1]])
+
+            elif cmd == "/import-rollback":
+                _cmd_import_rollback(conn, bank, parts)
+
+            elif cmd == "/import-mapping":
+                _cmd_import_mapping(conn, parts)
+
+            elif cmd == "/review-categories":
+                _cmd_review_categories(conn)
+
+            elif cmd == "/cat-run":
+                _cmd_cat_run(conn, llm)
+
+            elif cmd == "/cat-accept":
+                _cmd_cat_accept(conn, parts)
+
+            elif cmd == "/cat-reject":
+                _cmd_cat_reject(conn, parts)
 
             else:
                 _CONSOLE.print(

@@ -179,6 +179,7 @@ def _dispatch_tool(
         dummy = Transaction(
             id="tmp", account_id="tmp", amount=-1.0, currency="CHF",
             merchant=merchant, category=None, ts=datetime.now(),
+            line_category=None, import_batch_id=None, external_fingerprint=None,
         )
         category = tools_module.categorize_transaction(dummy)
         return {"merchant": merchant, "category": category}
@@ -192,7 +193,8 @@ def _fetch_transactions(
     conn: sqlite3.Connection, user_id: str, days: int
 ) -> list[Transaction]:
     rows = conn.execute(
-        "SELECT t.id, t.account_id, t.amount, t.currency, t.merchant, t.category, t.ts "
+        "SELECT t.id, t.account_id, t.amount, t.currency, t.merchant, t.category, "
+        "t.line_category, t.ts, t.import_batch_id, t.external_fingerprint "
         "FROM transactions t JOIN accounts a ON t.account_id=a.id "
         "WHERE a.user_id=? AND t.ts >= datetime('now', ?) ORDER BY t.ts",
         (user_id, f"-{days} days"),
@@ -200,8 +202,9 @@ def _fetch_transactions(
     return [
         Transaction(
             id=r[0], account_id=r[1], amount=r[2], currency=r[3],
-            merchant=r[4], category=r[5],
-            ts=datetime.fromisoformat(r[6]),
+            merchant=r[4], category=r[5], line_category=r[6],
+            ts=datetime.fromisoformat(r[7]),
+            import_batch_id=r[8], external_fingerprint=r[9],
         )
         for r in rows
     ]
