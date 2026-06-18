@@ -74,7 +74,7 @@ def _detect() -> LiteLLMAdapter | None:
 
     # 4. Google
     if os.getenv("GOOGLE_API_KEY"):
-        return LiteLLMAdapter(model="gemini/gemini-1.5-pro")
+        return LiteLLMAdapter(model="gemini/gemini-2.5-flash")
 
     # 5. Ollama (OpenAI-compat endpoint)
     ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434/v1")
@@ -145,7 +145,7 @@ def _interactive_setup() -> LiteLLMAdapter:
     if choice == 3:
         key = _ask("GOOGLE_API_KEY")
         os.environ["GOOGLE_API_KEY"] = key
-        return LiteLLMAdapter(model="gemini/gemini-1.5-pro")
+        return LiteLLMAdapter(model="gemini/gemini-2.5-flash")
 
     if choice == 4:
         url = _ask("llama.cpp base URL [http://localhost:8080/v1]") or "http://localhost:8080/v1"
@@ -268,7 +268,7 @@ def reconfigure_adapter(console=None) -> LiteLLMAdapter:
         key = _ask_key("GOOGLE_API_KEY")
         os.environ["GOOGLE_API_KEY"] = key
         _offer_save("GOOGLE_API_KEY", key)
-        return LiteLLMAdapter(model="gemini/gemini-1.5-pro")
+        return LiteLLMAdapter(model="gemini/gemini-2.5-flash")
 
     if choice == 4:
         url = _ask("llama.cpp base URL") or "http://localhost:8080/v1"
