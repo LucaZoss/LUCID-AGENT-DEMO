@@ -20,10 +20,10 @@ For day-to-day usage (environment variables and slash commands), see [REPL_READM
 
 | Path | Role |
 |------|------|
-| [`ingest/csv_detect.py`](../ingest/csv_detect.py) | Header alias scoring, ambiguity vs resolved mapping, delimiter/encoding sniff |
+| [`ingest/csv_detect.py`](../ingest/csv_detect.py) | Header alias scoring, `find_header_row_index`, ambiguity vs resolved mapping, encoding sniff |
 | [`ingest/csv_normalize.py`](../ingest/csv_normalize.py) | Decimal and date parsing; signed amount from `single_amount` or `debit_credit` |
 | [`ingest/profiles.py`](../ingest/profiles.py) | CRUD for `csv_mapping_profiles` |
-| [`ingest/importer.py`](../ingest/importer.py) | `preview_csv_file`, `import_csv_files`, `rollback_import_batch` |
+| [`ingest/importer.py`](../ingest/importer.py) | `preview_csv_file`, `import_csv_files`, `rollback_import_batch`; uses pandas for dialect-robust reading |
 | [`ingest/cli.py`](../ingest/cli.py) | `python -m ingest.cli <file.csv>` — JSON preview for scripts/CI |
 | [`agents/ledger_categorizer.py`](../agents/ledger_categorizer.py) | Small `LLMProvider` tool loop (narrow system prompt) |
 | [`agents/ledger_tools.py`](../agents/ledger_tools.py) | `propose_spending_bucket`, `propose_line_category`, list/apply/reject proposals |
@@ -70,13 +70,14 @@ flowchart LR
   subgraph ingest [ingest package]
     A[Read bytes]
     B[Sniff encoding + delimiter]
-    C[Parse header row]
+    C[find_header_row_index]
     D[Resolve mapping]
-    E[Iterate data rows]
+    E[pandas read_csv header=idx]
+    F[Iterate data rows]
   end
   D --> P[(csv_mapping_profiles)]
-  E --> T[(transactions)]
-  E --> Bt[(import_batches)]
+  F --> T[(transactions)]
+  F --> Bt[(import_batches)]
 ```
 
 **Mapping resolution order** (in `import_csv_files`):
@@ -98,6 +99,71 @@ flowchart LR
 
 ---
 
+## CSV dialect robustness
+
+Banks export CSV in wildly different shapes. Three classes of problems previously broke import silently:
+
+| Problem | Example | Old behaviour | Fix |
+|---------|---------|---------------|-----|
+| Excel separator hint | First line is `sep=;` (UBS MasterCard) | `sep=;` parsed as the header | `find_header_row_index` skips it |
+| Multiple metadata rows | Account number, holder, date range before the real header (UBS checking, BCGE) | All rows read as data with wrong columns | `find_header_row_index` scans up to 15 lines |
+| Redundant amount columns | CSV has `Amount` **and** `Debit` + `Credit` (UBS MasterCard) | Always picked `debit_credit`; empty Debit/Credit → 0 rows imported | `detect_mapping` samples real data to decide |
+
+### `find_header_row_index` — how it works
+
+Located in `ingest/csv_detect.py`. No bank-specific rules.
+
+```
+for each candidate line (up to max_scan=15):
+    split by delimiter → cells
+    score = Σ best_alias_weight(cell) over all cells
+    track line with highest score
+```
+
+`best_alias_weight` checks a cell's normalized name against every Lucid field alias table (date, amount, merchant, debit, credit, currency, reference). Metadata rows score near zero because their cells are account numbers, holder names, or date ranges — none of which match field aliases. The actual header row scores high because `Buchungsdatum`, `Betrag`, `Debit`, `Date`, `Booking text`, etc. all match.
+
+The returned index is passed as `header=idx` to `pandas.read_csv`, which skips metadata rows cleanly.
+
+### sign_rule disambiguation
+
+When a CSV has both an `Amount` column **and** separate `Debit` / `Credit` columns, `detect_mapping` takes a sample of up to 20 data rows and counts non-empty values in each:
+
+```python
+if amt_filled > max(deb_filled, cred_filled):
+    sign_rule = "single_amount"   # e.g. UBS MasterCard
+else:
+    sign_rule = "debit_credit"    # e.g. PostFinance checking
+```
+
+### Encoding detection
+
+`sniff_csv_text` tries `utf-8-sig` → `utf-8` first (covers the majority of modern exports). If both raise `UnicodeDecodeError`, it falls back to `chardet` for legacy encodings (ISO-8859-1, cp1252, etc.). Chardet is intentionally not used first because it can misidentify short UTF-8 texts containing non-ASCII characters as ISO-8859-9 or similar.
+
+### Column alias coverage
+
+`_MERCHANT_ALIASES` and `_DATE_ALIASES` were extended to cover common English bank column names:
+
+| New alias | Field | Score |
+|-----------|-------|-------|
+| `booking text` | merchant | 0.92 |
+| `description` | merchant | 0.85 |
+| `narrative` | merchant | 0.80 |
+| `purchase date` | date | 0.95 |
+| `booked` | date | 0.60 |
+
+### Optional-field tie-breaking
+
+When two columns tie for an optional field (e.g. `Currency` and `Original currency` both match the `"currency"` alias), the shorter header name is picked silently. Ties on required fields (date, merchant, amount) still block import and surface an error.
+
+### Dependencies added
+
+| Package | Why |
+|---------|-----|
+| `pandas >= 2.0` | Replaces `csv.DictReader`; robust dialect handling, `header=N` to skip metadata rows |
+| `chardet >= 4.0` | Encoding detection fallback for non-UTF-8 bank exports |
+
+---
+
 ## Ledger categorization agent
 
 - **Entry:** `run_ledger_categorizer(llm, conn, user_id, …)` in [`agents/ledger_categorizer.py`](../agents/ledger_categorizer.py).
@@ -108,7 +174,19 @@ flowchart LR
 
 Use **`/setup`** in the REPL for a full checklist covering the import folder, `LUCID_DB_PATH` / `LUCID_LEDGER`, and the slash commands below.
 
-**Human verification (REPL):**
+**CSV import (REPL):**
+
+| Command | Action |
+|---------|--------|
+| `/import <file.csv>` | **Guided flow**: preview detected mapping + 3 sample rows, prompt `y/N`, import on confirm |
+| `/import` | Batch-import all `*.csv` in `LUCID_IMPORT_DIR` without confirmation |
+| `/import preview <file.csv>` | Dry-run only — shows mapping and samples, writes nothing |
+| `/import-rollback <batch_id>` | Delete all transactions from a batch and rebalance the account |
+| `/import-mapping list` | List saved mapping profiles |
+| `/import-mapping save <name>` | Save the last previewed mapping as a named profile (auto-matched on future imports with the same header layout) |
+| `/import-mapping set-default <id>` | Mark a profile as default |
+
+**Categorization (REPL):**
 
 | Command | Action |
 |---------|--------|
@@ -131,14 +209,23 @@ Use **`/setup`** in the REPL for a full checklist covering the import folder, `L
 
 ## Tests
 
-- [`tests/test_ingest_csv.py`](../tests/test_ingest_csv.py) — header detection, import insert/dedupe, profile round-trip, rollback, preview.
+- [`tests/test_ingest_csv.py`](../tests/test_ingest_csv.py) — 14 tests covering:
+  - Header detection (semicolon, UTF-8, encoding fallback)
+  - `strip_sep_hint` utility
+  - `find_header_row_index` with single `sep=;` row, 5 metadata rows, and French-language metadata
+  - `detect_mapping` sign_rule disambiguation (Amount vs Debit+Credit via sample rows)
+  - UBS MasterCard end-to-end format (sep=; + mixed columns)
+  - Multi-metadata-row end-to-end format (5 preamble lines before real header)
+  - Import insert + duplicate skip + force re-import
+  - Profile save and auto-reload by header hash
+  - Rollback
+  - Preview
 - [`tests/test_ledger_tools.py`](../tests/test_ledger_tools.py) — invalid bucket rejection, propose + apply updates `transactions`.
 
 Run:
 
 ```bash
-uv sync --extra dev
-uv run pytest tests/test_ingest_csv.py tests/test_ledger_tools.py -q
+pytest tests/test_ingest_csv.py tests/test_ledger_tools.py -q
 ```
 
 ---

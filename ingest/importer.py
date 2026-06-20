@@ -4,7 +4,6 @@ Orchestrate CSV file import: batches, dedupe fingerprints, balance reconciliatio
 
 from __future__ import annotations
 
-import csv
 import hashlib
 import io
 import uuid
@@ -14,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import sqlite3
+import pandas as pd
 
 from ingest.csv_detect import (
     MappingAmbiguity,
@@ -22,6 +22,7 @@ from ingest.csv_detect import (
     header_row_hash,
     parse_header_row,
     sniff_csv_text,
+    strip_sep_hint,
 )
 from ingest.csv_normalize import (
     normalize_currency,
@@ -60,45 +61,50 @@ def _read_file_bytes(path: Path) -> bytes:
     return path.read_bytes()
 
 
+def _rows_from_csv(
+    raw: bytes, encoding: str, delimiter: str, header_row_idx: int = 0
+) -> tuple[list[str], list[dict[str, str]]]:
+    """Parse CSV bytes into (headers, rows) using pandas.
+
+    *header_row_idx* tells pandas which line is the header, letting it skip
+    any number of bank-specific metadata rows automatically.
+    """
+    text = raw.decode(encoding, errors="replace")
+    if not text.strip():
+        return [], []
+    df = pd.read_csv(
+        io.StringIO(text),
+        sep=delimiter,
+        dtype=str,
+        keep_default_na=False,
+        on_bad_lines="skip",
+        header=header_row_idx,
+    )
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.fillna("")
+    headers = list(df.columns)
+    rows = df.to_dict(orient="records")
+    return headers, rows  # type: ignore[return-value]
+
+
 def preview_csv_file(path: Path) -> dict[str, Any]:
     """Load headers, sniff encoding/delimiter, run auto-detect (no DB)."""
     raw = _read_file_bytes(path)
-    headers, enc, delim = parse_header_row(raw)
-    detected = detect_mapping(headers, encoding=enc, delimiter=delim)
-    sample_rows: list[dict[str, str]] = []
-    text = raw.decode(enc)
-    lines = text.splitlines()
-    body = "\n".join(lines[1 : 1 + 5]) if len(lines) > 1 else ""
-    if body:
-        reader = csv.DictReader(io.StringIO(lines[0] + "\n" + body), delimiter=delim)
-        for i, row in enumerate(reader):
-            if i >= 5:
-                break
-            sample_rows.append({k or "": (v or "") for k, v in row.items()})
+    headers, enc, delim, header_idx = parse_header_row(raw)
+    # Read a generous sample to let detect_mapping disambiguate sign_rule from data.
+    _, all_rows = _rows_from_csv(raw, enc, delim, header_idx)
+    sample_rows = all_rows[:20]
+    detected = detect_mapping(headers, encoding=enc, delimiter=delim, sample_rows=sample_rows)
     return {
         "path": str(path),
         "headers": headers,
         "encoding": enc,
         "delimiter": delim,
+        "header_row_index": header_idx,
         "header_hash": header_row_hash(headers, delim),
         "detection": detected,
-        "sample_rows": sample_rows,
+        "sample_rows": all_rows[:5],
     }
-
-
-def _rows_from_csv(
-    raw: bytes, encoding: str, delimiter: str
-) -> tuple[list[str], list[dict[str, str]]]:
-    text = raw.decode(encoding)
-    lines = text.splitlines()
-    if not lines:
-        return [], []
-    reader = csv.DictReader(io.StringIO(text), delimiter=delimiter)
-    headers = reader.fieldnames or []
-    rows = []
-    for row in reader:
-        rows.append({(k or "").strip(): (v or "").strip() for k, v in row.items()})
-    return [h.strip() for h in headers if h is not None], rows
 
 
 def import_csv_files(
@@ -139,10 +145,7 @@ def import_csv_files(
                 )
                 continue
 
-        enc, delim = sniff_csv_text(raw)
-        headers, enc2, delim2 = parse_header_row(raw)
-        enc = enc2 or enc
-        delim = delim2 or delim
+        headers, enc, delim, header_idx = parse_header_row(raw)
 
         resolved: ResolvedColumnMapping | None = mapping
         used_profile: str | None = None
@@ -171,7 +174,13 @@ def import_csv_files(
                 used_profile = p2["id"]
 
         if resolved is None:
-            det = detect_mapping(headers, encoding=enc, delimiter=delim)
+            _, sample_rows_for_detect = _rows_from_csv(raw, enc, delim, header_idx)
+            det = detect_mapping(
+                headers,
+                encoding=enc,
+                delimiter=delim,
+                sample_rows=sample_rows_for_detect[:20],
+            )
             if isinstance(det, MappingAmbiguity):
                 results.append(
                     ImportResult(
@@ -183,7 +192,7 @@ def import_csv_files(
                 continue
             resolved = det
 
-        _, data_rows = _rows_from_csv(raw, resolved.encoding, resolved.delimiter)
+        _, data_rows = _rows_from_csv(raw, resolved.encoding, resolved.delimiter, header_idx)
         batch_id = str(uuid.uuid4())
         now_iso = datetime.now(timezone.utc).isoformat()
         conn.execute(
@@ -204,6 +213,7 @@ def import_csv_files(
         inserted = 0
         skipped_dup = 0
         skipped_bad = 0
+        skipped_pending = 0
         warns: list[str] = []
         income_seen = False
 
@@ -215,21 +225,30 @@ def import_csv_files(
             date_raw = row.get(resolved.column_map.get("date", ""), "")
             ts = parse_date_to_utc(date_raw)
             if ts is None:
+                # Empty date in debit_credit mode = pending transaction (not yet booked)
+                if not date_raw.strip() and resolved.sign_rule == "debit_credit":
+                    skipped_pending += 1
                 skipped_bad += 1
                 continue
 
             amt = signed_amount_from_row(row, resolved.column_map, resolved.sign_rule)
             if amt is None or amt == 0.0:
+                if amt is None and resolved.sign_rule == "debit_credit":
+                    skipped_pending += 1
                 skipped_bad += 1
                 continue
 
             merch_key = resolved.column_map.get("merchant", "")
             merchant = str(row.get(merch_key, "")).strip() or "(no description)"
-            ccy = normalize_currency(row, resolved.column_map)
-            if ccy != "CHF":
-                warns.append(f"non-CHF row skipped ({ccy}): {merchant[:40]}")
-                skipped_bad += 1
-                continue
+            # For credit-card exports (single_amount_flipped) the Amount column is
+            # already the CHF-billed amount regardless of the original-currency column.
+            # Skip the currency filter so foreign-currency charges aren't lost.
+            if resolved.sign_rule != "single_amount_flipped":
+                ccy = normalize_currency(row, resolved.column_map)
+                if ccy != "CHF":
+                    warns.append(f"non-CHF row skipped ({ccy}): {merchant[:40]}")
+                    skipped_bad += 1
+                    continue
 
             if amt > 0:
                 income_seen = True
@@ -276,6 +295,13 @@ def import_csv_files(
             (inserted, skipped_dup, "completed", batch_id),
         )
         conn.commit()
+
+        if skipped_pending:
+            warns.append(
+                f"{skipped_pending} pending transaction(s) skipped "
+                "(Debit/Credit empty — not yet settled in CHF). "
+                "They will appear once booked."
+            )
 
         if not income_seen and inserted:
             warns.append(

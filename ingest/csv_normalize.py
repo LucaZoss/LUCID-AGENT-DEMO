@@ -72,12 +72,21 @@ def signed_amount_from_row(
     column_map: dict[str, str],
     sign_rule: str,
 ) -> float | None:
-    """Return signed CHF amount (negative=outflow) or None if row is empty."""
-    if sign_rule == "single_amount":
+    """Return signed CHF amount (negative=outflow) or None if row is empty.
+
+    sign_rule values:
+      single_amount         — column already uses Lucid sign convention (negative=outflow)
+      single_amount_flipped — column uses credit-card convention (positive=outflow); negated here
+      debit_credit          — two separate columns for debits and credits
+    """
+    if sign_rule in ("single_amount", "single_amount_flipped"):
         key = column_map.get("amount")
         if not key:
             return None
-        return parse_decimal(row.get(key, ""))
+        val = parse_decimal(row.get(key, ""))
+        if val is None:
+            return None
+        return -val if sign_rule == "single_amount_flipped" else val
 
     if sign_rule == "debit_credit":
         dk = column_map.get("debit")

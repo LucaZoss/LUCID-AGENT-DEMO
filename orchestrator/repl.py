@@ -40,6 +40,7 @@ from contracts import Transaction
 from db.db_schema import init_db
 from llm.config import build_adapter, reconfigure_adapter
 from orchestrator.router import handle_message
+from orchestrator.startup import USER_ID as _USER_ID, CONV_ID as _CONV_ID, run_startup
 
 from agents.ledger_categorizer import run_ledger_categorizer
 from agents import ledger_tools
@@ -51,11 +52,6 @@ from ingest.importer import (
     rollback_import_batch,
 )
 from ingest import profiles
-
-# ── Session constants ──────────────────────────────────────────────────────────
-
-_USER_ID = "demo-user-1"
-_CONV_ID  = "demo-conv-1"
 
 # Last `/import-preview` result — used by `/import-mapping save`
 _PENDING_CSV_PREVIEW: dict | None = None
@@ -84,38 +80,6 @@ _SAVE_COLOR   = "#22c55e"   # green   — savings
 _INCOME_COLOR = "#34d399"   # emerald — income
 
 _CONSOLE = Console()
-
-# ── Demo seed data ─────────────────────────────────────────────────────────────
-
-_DEMO_TRANSACTIONS: list[tuple[str, float, str | None]] = [
-    # Income (3 months of salary)
-    ("Salary ACME AG",           5200.00,  None),
-    ("Salary ACME AG",           5200.00,  None),
-    ("Salary ACME AG",           5200.00,  None),
-    # Needs
-    ("Miete Zurich",            -1800.00, "need"),
-    ("Helsana",                  -420.00, "need"),
-    ("Coop",                     -480.00, "need"),
-    ("Migros",                   -220.00, "need"),
-    ("SBB Halbtax",              -180.00, "need"),
-    ("Swisscom",                  -79.00, "need"),
-    ("Coop",                     -155.00, "need"),
-    ("EWZ Strom",                 -62.00, "need"),
-    # Wants
-    ("Netflix",                   -13.00, "want"),
-    ("Spotify",                   -10.00, "want"),
-    ("Starbucks",                 -42.00, "want"),
-    ("Restaurant Helvetia",       -68.00, "want"),
-    ("Zara",                      -89.00, "want"),
-    ("Kino Kosmos",               -30.00, "want"),
-    ("Starbucks",                 -14.00, "want"),
-    ("Tibits",                    -25.00, "want"),
-    ("Amazon.de",                 -55.00, "want"),
-    # Savings
-    ("VIAC 3a",                  -400.00, "savings"),
-    ("Swissquote",               -200.00, "savings"),
-]
-
 
 # ── Banner ─────────────────────────────────────────────────────────────────────
 
@@ -162,22 +126,26 @@ def _render_help() -> None:
     body = Text()
     body.append("Commands\n\n", style="bold")
     commands = [
-        ("/help             ", "show this message"),
-        ("/setup            ", "CSV import & persistence checklist (env + REPL steps)"),
-        ("/model            ", "configure LLM provider or API key"),
-        ("/account          ", "show account balance and last 10 transactions"),
-        ("/split            ", "show your live needs / wants / savings ratios"),
-        ("/goal             ", "show your active goal and feasibility"),
-        ("/import              ", "import all *.csv from LUCID_IMPORT_DIR (see REPL_README)"),
-        ("/import preview <f>  ", "preview headers + auto-detect mapping"),
-        ("/import-rollback <id>", "remove transactions from an import batch"),
-        ("/import-mapping …    ", "list | save <name> | set-default <profile_id>"),
-        ("/review-categories   ", "show pending bucket/line proposals + deterministic hint"),
-        ("/cat-run             ", "run ledger categorizer LLM on uncategorized outflows"),
-        ("/cat-accept <id> …   ", "accept proposal; optional: bucket need line groceries"),
-        ("/cat-reject <id>     ", "reject a pending proposal"),
-        ("/clear            ", "clear the screen (session continues)"),
-        ("/quit             ", "exit"),
+        ("/help                 ", "show this message"),
+        ("/setup                ", "CSV import & persistence checklist"),
+        ("/model                ", "configure LLM provider or API key"),
+        ("/account              ", "show account balance and last 10 transactions"),
+        ("/split                ", "show your live needs / wants / savings ratios"),
+        ("/goal                 ", "show your active goal and feasibility"),
+        ("/txn-add              ", "add a transaction interactively"),
+        ("/txn-remove <id>      ", "remove a transaction (with confirmation)"),
+        ("/txn-edit <id>        ", "edit a transaction's fields"),
+        ("/import <file.csv>    ", "preview + confirm + import a single CSV file (guided)"),
+        ("/import               ", "batch-import all *.csv in LUCID_IMPORT_DIR"),
+        ("/import preview <f>   ", "dry-run preview only — no rows written"),
+        ("/import-rollback <id> ", "remove transactions from an import batch"),
+        ("/import-mapping …     ", "list | save <name> | set-default <profile_id>"),
+        ("/review-categories    ", "show pending bucket/line proposals + deterministic hint"),
+        ("/cat-run              ", "run ledger categorizer LLM on uncategorized outflows"),
+        ("/cat-accept <id> …    ", "accept proposal; optional: bucket need line groceries"),
+        ("/cat-reject <id>      ", "reject a pending proposal"),
+        ("/clear                ", "clear the screen (session continues)"),
+        ("/quit                 ", "exit"),
     ]
     for cmd, desc in commands:
         body.append(f"  {cmd}", style=f"bold {_ACCENT}")
@@ -532,6 +500,19 @@ def _seed_minimal_user(conn) -> None:
     conn.commit()
 
 
+def _seed_demo_data(conn) -> None:
+    """Legacy shim — seeding is now handled by orchestrator.startup._seed_demo.
+    Kept only so existing tests that call this directly continue to work."""
+    from orchestrator.startup import _seed_demo, ACCOUNT_ID
+    _seed_demo(conn, _USER_ID, ACCOUNT_ID, _CONV_ID)
+
+
+def _seed_minimal_user(conn) -> None:
+    """Legacy shim — seeding is now handled by orchestrator.startup._seed_minimal."""
+    from orchestrator.startup import _seed_minimal, ACCOUNT_ID
+    _seed_minimal(conn, _USER_ID, ACCOUNT_ID, _CONV_ID)
+
+
 def _import_dir() -> Path:
     """Directory scanned for ``/import`` (override with ``LUCID_IMPORT_DIR``)."""
     p = os.environ.get("LUCID_IMPORT_DIR", "data/imports")
@@ -577,12 +558,22 @@ def _render_setup_help() -> None:
     body.append("export LUCID_DB_PATH=./lucid_demo.db\n\n", style="bold")
 
     body.append("4. In the REPL:\n   ", style="")
-    body.append("/import-preview yourfile.csv", style=f"bold {_ACCENT}")
-    body.append(" — verify column detection\n   ", style="")
+    body.append("/import yourfile.csv", style=f"bold {_ACCENT}")
+    body.append(
+        " — guided flow: shows detected mapping + 3 sample rows,\n"
+        "     asks y/N before writing anything. Works for most bank CSV formats.\n   ",
+        style="",
+    )
+    body.append("/import preview yourfile.csv", style=f"bold {_ACCENT}")
+    body.append(" — dry-run preview (no import)\n   ", style="")
     body.append("/import-mapping save MyBank", style=f"bold {_ACCENT}")
-    body.append(" — save mapping after a good preview\n   ", style="")
+    body.append(
+        " — save the detected column mapping as a profile\n"
+        "     (auto-matched on future imports of files with the same headers)\n   ",
+        style="",
+    )
     body.append("/import", style=f"bold {_ACCENT}")
-    body.append(" — import all *.csv from the import folder\n   ", style="")
+    body.append(" — batch-import all *.csv from the import folder\n   ", style="")
     body.append("/cat-run", style=f"bold {_ACCENT}")
     body.append(" → ", style="")
     body.append("/review-categories", style=f"bold {_ACCENT}")
@@ -653,81 +644,171 @@ def _run_onboarding(llm, conn, bank: DBBankingProvider) -> None:
 # ── CSV import & ledger categorization (REPL glue) ─────────────────────────────
 
 
-def _cmd_import_run(conn: sqlite3.Connection, bank: DBBankingProvider, parts: list[str]) -> None:
-    """Import all ``*.csv`` from ``LUCID_IMPORT_DIR``."""
-    force = any(p in ("--force", "force") for p in parts)
-    d = _import_dir()
-    csvs = sorted(d.glob("*.csv"))
-    if not csvs:
-        _CONSOLE.print(
-            f"[{_DIM_TEXT}]No CSV files in {d.resolve()}. "
-            f"Drop exports there or set LUCID_IMPORT_DIR.[/{_DIM_TEXT}]"
+def _resolve_csv_path(name: str) -> Path | None:
+    """Find a CSV by name in LUCID_IMPORT_DIR or as an absolute path."""
+    p = Path(name)
+    if p.is_absolute() and p.is_file():
+        return p
+    candidate = _import_dir() / name
+    if candidate.is_file():
+        return candidate
+    return None
+
+
+def _render_preview_panel(prev: dict) -> None:
+    """Print detection summary + sample rows table for a preview result."""
+    global _PENDING_CSV_PREVIEW
+    det = prev["detection"]
+
+    msg = (
+        f"path: {prev['path']}\n"
+        f"encoding: {prev['encoding']}  delimiter: {prev['delimiter']!r}\n"
+        f"header_hash: {prev['header_hash']}\n"
+    )
+    if isinstance(det, MappingAmbiguity):
+        msg += f"\n[{_RED}]mapping failed — {det.message}[/{_RED}]\n"
+        msg += f"[{_DIM_TEXT}]headers found: {', '.join(prev['headers'])}[/{_DIM_TEXT}]\n"
+        if det.best_effort:
+            msg += f"[{_AMBER}]best-effort: {', '.join(f'{k}→{v}' for k,v in det.best_effort.items())}[/{_AMBER}]\n"
+        msg += (
+            f"\n[{_DIM_TEXT}]Tip: run [bold]/import-mapping save MyBank[/bold] after the "
+            f"preview succeeds, or override mapping manually.[/{_DIM_TEXT}]"
         )
-        return
+    else:
+        msg += f"\n[{_GREEN}]mapping OK[/{_GREEN}]  sign_rule={det.sign_rule}\n"
+        msg += "columns: " + ", ".join(f"[bold]{k}[/bold]→{v}" for k, v in det.column_map.items())
+
+    _CONSOLE.print(Panel(msg, title="import preview", border_style=_ACCENT_DEEP))
+
+    if prev["sample_rows"]:
+        tbl = Table(title="sample rows (first 5)", box=None, show_lines=True)
+        keys = list(prev["sample_rows"][0].keys())
+        for k in keys:
+            tbl.add_column(k[:18], overflow="fold", max_width=22)
+        for row in prev["sample_rows"]:
+            tbl.add_row(*(str(row.get(k, ""))[:60] for k in keys))
+        _CONSOLE.print(tbl)
+
+
+def _print_import_result(r: ImportResult) -> None:
+    color = _RED if r.skipped else _GREEN
+    body = f"[bold]{Path(r.path).name}[/bold]  [{color}]{r.message}[/{color}]\n"
+    if r.batch_id:
+        body += (
+            f"  batch  {r.batch_id[:8]}…\n"
+            f"  inserted [{_GREEN}]{r.rows_inserted}[/{_GREEN}]  "
+            f"duplicates skipped {r.rows_skipped_duplicate}  "
+            f"invalid {r.rows_skipped_invalid}\n"
+        )
+    for w in r.warnings:
+        body += f"  [{_AMBER}]⚠  {w}[/{_AMBER}]\n"
+    _CONSOLE.print(Panel(body.rstrip(), title="import", border_style=_ACCENT_DEEP))
+
+
+def _cmd_import_run(conn: sqlite3.Connection, bank: DBBankingProvider, parts: list[str]) -> None:
+    """Guided single-file import OR batch import of all *.csv in LUCID_IMPORT_DIR."""
+    global _PENDING_CSV_PREVIEW
+    force = any(p in ("--force", "force") for p in parts)
+
     accounts = bank.get_accounts()
     if not accounts:
         _CONSOLE.print(f"[{_RED}]No account to import into.[/{_RED}]")
         return
     acc_id = accounts[0].id
+
+    # Find optional profile override.
     profile_id: str | None = None
     for i, p in enumerate(parts):
         if p == "profile" and i + 1 < len(parts):
             profile_id = parts[i + 1]
             break
+
+    # Single-file guided mode: /import <filename.csv>
+    filename_arg = next(
+        (p for p in parts[1:] if p.endswith(".csv") and p != "profile"), None
+    )
+    if filename_arg:
+        path = _resolve_csv_path(filename_arg)
+        if path is None:
+            _CONSOLE.print(
+                f"[{_RED}]File not found: {filename_arg}[/{_RED}]\n"
+                f"[{_DIM_TEXT}]Import dir: {_import_dir().resolve()}[/{_DIM_TEXT}]"
+            )
+            return
+
+        prev = preview_csv_file(path)
+        _PENDING_CSV_PREVIEW = {"path": str(path), "preview": prev}
+        _render_preview_panel(prev)
+
+        det = prev["detection"]
+        if isinstance(det, MappingAmbiguity):
+            _CONSOLE.print(
+                f"[{_RED}]Cannot import — column mapping is ambiguous (see above).[/{_RED}]\n"
+                f"[{_DIM_TEXT}]Fix the CSV headers or save a custom mapping profile.[/{_DIM_TEXT}]"
+            )
+            return
+
+        try:
+            answer = _CONSOLE.input(
+                f"\n[{_ACCENT}]Import {path.name} into your ledger? [[bold]y[/bold]/N] [/{_ACCENT}]"
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            _CONSOLE.print(f"[{_DIM_TEXT}]Import cancelled.[/{_DIM_TEXT}]")
+            return
+
+        if answer != "y":
+            _CONSOLE.print(f"[{_DIM_TEXT}]Import cancelled.[/{_DIM_TEXT}]")
+            return
+
+        results = import_csv_files(
+            conn, _USER_ID, acc_id, [path],
+            profile_id=profile_id, force_reimport=force,
+        )
+        for r in results:
+            _print_import_result(r)
+        return
+
+    # Batch mode: /import (no filename)
+    d = _import_dir()
+    csvs = sorted(d.glob("*.csv"))
+    if not csvs:
+        _CONSOLE.print(
+            f"[{_DIM_TEXT}]No CSV files in {d.resolve()}.\n"
+            f"Drop exports there, set LUCID_IMPORT_DIR, "
+            f"or use [bold]/import <filename.csv>[/bold] with a path.[/{_DIM_TEXT}]"
+        )
+        return
+
+    _CONSOLE.print(
+        f"[{_DIM_TEXT}]Found {len(csvs)} file(s) in {d.resolve()} — importing…[/{_DIM_TEXT}]"
+    )
     results = import_csv_files(
         conn, _USER_ID, acc_id, csvs, profile_id=profile_id, force_reimport=force,
     )
     for r in results:
-        body = (
-            f"[bold]{r.path}[/bold]\n"
-            f"  skipped: {r.skipped}  message: {r.message}\n"
-        )
-        if r.batch_id:
-            body += (
-                f"  batch_id: {r.batch_id}\n"
-                f"  inserted: {r.rows_inserted}  dup_skips: {r.rows_skipped_duplicate} "
-                f"invalid: {r.rows_skipped_invalid}\n"
-            )
-        for w in r.warnings:
-            body += f"  [{_AMBER}]warn[/{_AMBER}] {w}\n"
-        _CONSOLE.print(Panel(body.rstrip(), title="import", border_style=_ACCENT_DEEP))
+        _print_import_result(r)
 
 
 def _cmd_import_preview(parts: list[str]) -> None:
-    """Preview detection + sample rows for one file in the import directory."""
+    """Dry-run preview: show header detection + sample rows, no import."""
     global _PENDING_CSV_PREVIEW
-    if len(parts) < 3:
+    # Support both '/import preview <f>' and '/import-preview <f>'
+    name = parts[2] if len(parts) >= 3 else (parts[1] if len(parts) >= 2 else "")
+    if not name or not name.endswith(".csv"):
         _CONSOLE.print(
-            f"[{_DIM_TEXT}]Usage: /import-preview <filename.csv>[/{_DIM_TEXT}]"
+            f"[{_DIM_TEXT}]Usage: /import preview <filename.csv>[/{_DIM_TEXT}]"
         )
         return
-    name = parts[2]
-    path = _import_dir() / name
-    if not path.is_file():
-        _CONSOLE.print(f"[{_RED}]File not found: {path}[/{_RED}]")
+    path = _resolve_csv_path(name)
+    if path is None:
+        _CONSOLE.print(
+            f"[{_RED}]File not found: {name}[/{_RED}]\n"
+            f"[{_DIM_TEXT}]Import dir: {_import_dir().resolve()}[/{_DIM_TEXT}]"
+        )
         return
     prev = preview_csv_file(path)
     _PENDING_CSV_PREVIEW = {"path": str(path), "preview": prev}
-    det = prev["detection"]
-    tbl = Table(title="sample rows", box=None)
-    if prev["sample_rows"]:
-        keys = list(prev["sample_rows"][0].keys())
-        for k in keys:
-            tbl.add_column(k[:20], overflow="fold")
-        for row in prev["sample_rows"]:
-            tbl.add_row(*(row.get(k, "")[:80] for k in keys))
-    msg = (
-        f"path: {prev['path']}\nencoding: {prev['encoding']}  delimiter: {prev['delimiter']!r}\n"
-        f"header_hash: {prev['header_hash']}\n"
-    )
-    if isinstance(det, MappingAmbiguity):
-        msg += f"\n[{_RED}]mapping: {det.message}[/{_RED}]"
-    else:
-        msg += f"\n[{_GREEN}]mapping OK[/{_GREEN}] sign_rule={det.sign_rule}\n"
-        msg += "columns: " + ", ".join(f"{k}→{v}" for k, v in det.column_map.items())
-    _CONSOLE.print(Panel(msg, title="import-preview", border_style=_ACCENT_DEEP))
-    if prev["sample_rows"]:
-        _CONSOLE.print(tbl)
+    _render_preview_panel(prev)
 
 
 def _cmd_import_rollback(conn: sqlite3.Connection, bank: DBBankingProvider, parts: list[str]) -> None:
@@ -877,6 +958,176 @@ def _cmd_cat_run(conn: sqlite3.Connection, llm) -> None:
     _CONSOLE.print(Panel(out, title="ledger categorizer", border_style=_ACCENT_DEEP))
 
 
+# ── Transaction editing ────────────────────────────────────────────────────────
+
+def _cmd_txn_add(bank: DBBankingProvider, conn: sqlite3.Connection) -> None:
+    """/txn-add — interactively add a transaction."""
+    from tools.categorize import categorize_transaction
+
+    try:
+        merchant = _CONSOLE.input(f"[{_ACCENT}]Merchant: [/{_ACCENT}]").strip()
+        if not merchant:
+            return
+        amt_str = _CONSOLE.input(
+            f"[{_ACCENT}]Amount in CHF (negative = outflow): [/{_ACCENT}]"
+        ).strip()
+        amount = float(amt_str)
+        date_str = _CONSOLE.input(
+            f"[{_ACCENT}]Date YYYY-MM-DD (blank = today): [/{_ACCENT}]"
+        ).strip()
+        ts = (
+            datetime.fromisoformat(date_str).replace(tzinfo=timezone.utc)
+            if date_str
+            else datetime.now(timezone.utc)
+        )
+        cat_str = _CONSOLE.input(
+            f"[{_ACCENT}]Category (need/want/savings, blank = auto): [/{_ACCENT}]"
+        ).strip().lower() or None
+    except (EOFError, KeyboardInterrupt):
+        _CONSOLE.print(f"[{_DIM_TEXT}]Cancelled.[/{_DIM_TEXT}]")
+        return
+    except ValueError as exc:
+        _CONSOLE.print(f"[{_RED}]{exc}[/{_RED}]")
+        return
+
+    accounts = bank.get_accounts()
+    if not accounts:
+        _CONSOLE.print(f"[{_RED}]No account found.[/{_RED}]")
+        return
+
+    dummy = Transaction(
+        id="x", account_id=accounts[0].id, amount=amount,
+        currency="CHF", merchant=merchant, category=None, ts=ts,
+    )
+    txn = Transaction(
+        id=f"txn-{uuid.uuid4().hex[:8]}",
+        account_id=accounts[0].id,
+        amount=round(amount, 2),
+        currency="CHF",
+        merchant=merchant,
+        category=cat_str if cat_str in ("need", "want", "savings") else categorize_transaction(dummy),
+        ts=ts,
+    )
+    bank.fire_transaction(txn)
+
+    sign = "+" if amount >= 0 else ""
+    color = _INCOME_COLOR if amount >= 0 else _RED
+    _CONSOLE.print(Panel(
+        Text.assemble(
+            ("Transaction added\n\n", "bold"),
+            ("Merchant  ", f"dim {_DIM_TEXT}"), (merchant + "\n", ""),
+            ("Amount    ", f"dim {_DIM_TEXT}"),
+            (f"{sign}{amount:,.2f} CHF\n", f"bold {color}"),
+            ("Category  ", f"dim {_DIM_TEXT}"), ((txn.category or "—") + "\n", "bold"),
+            ("ID        ", f"dim {_DIM_TEXT}"), (txn.id + "\n", f"dim {_DIMMER_TEXT}"),
+        ),
+        title=f"[bold {_ACCENT}]txn-add[/bold {_ACCENT}]",
+        border_style=f"dim {_ACCENT_DEEP}",
+        padding=(0, 1),
+    ))
+
+
+def _cmd_txn_remove(
+    conn: sqlite3.Connection, bank: DBBankingProvider, parts: list[str]
+) -> None:
+    """/txn-remove <id> — remove a transaction with confirmation."""
+    if len(parts) < 2:
+        _CONSOLE.print(f"[{_DIM_TEXT}]Usage: /txn-remove <transaction_id>[/{_DIM_TEXT}]")
+        return
+
+    txn_id = parts[1]
+    row = conn.execute(
+        "SELECT t.merchant, t.amount, t.account_id FROM transactions t "
+        "JOIN accounts a ON t.account_id=a.id WHERE t.id=? AND a.user_id=?",
+        (txn_id, _USER_ID),
+    ).fetchone()
+    if not row:
+        _CONSOLE.print(f"[{_RED}]Transaction not found: {txn_id}[/{_RED}]")
+        return
+
+    merchant, amount, account_id = row
+    try:
+        confirm = _CONSOLE.input(
+            f"[{_ACCENT}]Remove [{merchant}  CHF {amount:,.2f}]? [y/N] [/{_ACCENT}]"
+        ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        _CONSOLE.print(f"[{_DIM_TEXT}]Cancelled.[/{_DIM_TEXT}]")
+        return
+
+    if confirm != "y":
+        _CONSOLE.print(f"[{_DIM_TEXT}]Cancelled.[/{_DIM_TEXT}]")
+        return
+
+    conn.execute("DELETE FROM transactions WHERE id=?", (txn_id,))
+    conn.execute(
+        "UPDATE accounts SET balance = "
+        "(SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE account_id=?) "
+        "WHERE id=?",
+        (account_id, account_id),
+    )
+    conn.commit()
+    _CONSOLE.print(f"[{_GREEN}]Transaction {txn_id} removed.[/{_GREEN}]")
+
+
+def _cmd_txn_edit(
+    conn: sqlite3.Connection, bank: DBBankingProvider, parts: list[str]
+) -> None:
+    """/txn-edit <id> — edit a transaction's fields interactively."""
+    if len(parts) < 2:
+        _CONSOLE.print(f"[{_DIM_TEXT}]Usage: /txn-edit <transaction_id>[/{_DIM_TEXT}]")
+        return
+
+    txn_id = parts[1]
+    row = conn.execute(
+        "SELECT t.merchant, t.amount, t.category, t.ts, t.account_id FROM transactions t "
+        "JOIN accounts a ON t.account_id=a.id WHERE t.id=? AND a.user_id=?",
+        (txn_id, _USER_ID),
+    ).fetchone()
+    if not row:
+        _CONSOLE.print(f"[{_RED}]Transaction not found: {txn_id}[/{_RED}]")
+        return
+
+    merchant, amount, category, ts, account_id = row
+    _CONSOLE.print(
+        f"[{_DIM_TEXT}]Editing {txn_id}  "
+        f"[{merchant}  CHF {amount:,.2f}  {category or '—'}  {ts}]\n"
+        f"Press Enter to keep the current value.[/{_DIM_TEXT}]"
+    )
+
+    try:
+        new_merchant = (
+            _CONSOLE.input(f"[{_ACCENT}]Merchant [{merchant}]: [/{_ACCENT}]").strip()
+            or merchant
+        )
+        amt_str = _CONSOLE.input(
+            f"[{_ACCENT}]Amount [{amount:,.2f}]: [/{_ACCENT}]"
+        ).strip()
+        new_amount = float(amt_str) if amt_str else amount
+        cat_input = _CONSOLE.input(
+            f"[{_ACCENT}]Category [{category or '—'}] (need/want/savings): [/{_ACCENT}]"
+        ).strip().lower()
+        new_cat = cat_input if cat_input in ("need", "want", "savings") else category
+    except (EOFError, KeyboardInterrupt):
+        _CONSOLE.print(f"[{_DIM_TEXT}]Cancelled.[/{_DIM_TEXT}]")
+        return
+    except ValueError as exc:
+        _CONSOLE.print(f"[{_RED}]{exc}[/{_RED}]")
+        return
+
+    conn.execute(
+        "UPDATE transactions SET merchant=?, amount=?, category=? WHERE id=?",
+        (new_merchant, round(new_amount, 2), new_cat, txn_id),
+    )
+    conn.execute(
+        "UPDATE accounts SET balance = "
+        "(SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE account_id=?) "
+        "WHERE id=?",
+        (account_id, account_id),
+    )
+    conn.commit()
+    _CONSOLE.print(f"[{_GREEN}]Transaction {txn_id} updated.[/{_GREEN}]")
+
+
 # ── REPL loop ──────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -884,39 +1135,32 @@ def main() -> None:
 
     _render_banner()
 
-    llm = build_adapter(model_override)
-    _CONSOLE.print(
-        f"[{_DIMMER_TEXT}]provider: {llm.model}[/{_DIMMER_TEXT}]\n",
-        justify="center",
-    )
+    # Run staged startup: model → data source → (persistence → import → categorize → summary)
+    state = run_startup(_CONSOLE, model_override)
+    llm = state.llm
+    conn = state.conn
+    bank: DBBankingProvider = state.bank  # type: ignore[assignment]
 
-    db_path = os.environ.get("LUCID_DB_PATH", ":memory:")
-    conn = init_db(db_path)
-    if db_path == ":memory:":
-        _CONSOLE.print(
-            f"[{_AMBER}]Note:[/{_AMBER}] [{_DIM_TEXT}]In-memory DB — mapping profiles and "
-            f"CSV imports are lost when you exit. Set [bold]LUCID_DB_PATH[/bold] to persist."
-            f"[/{_DIM_TEXT}]"
-        )
-    ledger_mode = os.environ.get("LUCID_LEDGER", "demo").lower()
-    if ledger_mode == "import":
-        _seed_minimal_user(conn)
+    # DEMO path: run onboarding on first run, greet returning user otherwise
+    if state.data_source == "demo":
+        if state.is_first_run:
+            _run_onboarding(llm, conn, bank)
+        else:
+            _CONSOLE.print(
+                Panel(
+                    f"[{_DIM_TEXT}]Welcome back. Your account and goals are loaded. "
+                    f"Type [bold {_ACCENT}]/help[/bold {_ACCENT}] for commands."
+                    f"[/{_DIM_TEXT}]",
+                    border_style=f"dim {_ACCENT_DEEP}",
+                    padding=(0, 1),
+                )
+            )
     else:
-        _seed_demo_data(conn)
-
-    # BankingProvider — wired here; repl.py never touches SimulatedBank directly
-    bank: DBBankingProvider = make_db_provider(conn, _USER_ID)  # type: ignore[assignment]
-
-    # First-run onboarding — route into the goal_intake skill, not scripted here
-    if _is_first_run(conn, _USER_ID):
-        _run_onboarding(llm, conn, bank)
-
-    else:
-        # Returning user — quick greeting
+        # CSV path: data is already loaded and summarized — go straight to REPL
         _CONSOLE.print(
             Panel(
-                f"[{_DIM_TEXT}]Welcome back. Your account and goals are loaded. "
-                f"Type [bold {_ACCENT}]/help[/bold {_ACCENT}] for commands.[/{_DIM_TEXT}]",
+                f"[{_DIM_TEXT}]Data loaded. Type [bold {_ACCENT}]/help[/bold {_ACCENT}] "
+                f"for commands or start chatting.[/{_DIM_TEXT}]",
                 border_style=f"dim {_ACCENT_DEEP}",
                 padding=(0, 1),
             )
@@ -969,6 +1213,15 @@ def main() -> None:
             elif cmd == "/fire":
                 _cmd_fire(parts[1:], bank, conn)
 
+            elif cmd == "/txn-add":
+                _cmd_txn_add(bank, conn)
+
+            elif cmd == "/txn-remove":
+                _cmd_txn_remove(conn, bank, parts)
+
+            elif cmd == "/txn-edit":
+                _cmd_txn_edit(conn, bank, parts)
+
             elif cmd == "/import":
                 sub = parts[1].lower() if len(parts) > 1 else "run"
                 if sub == "preview":
@@ -977,7 +1230,7 @@ def main() -> None:
                     _cmd_import_run(conn, bank, parts)
 
             elif cmd == "/import-preview" and len(parts) >= 2:
-                _cmd_import_preview(["/import", "preview", parts[1]])
+                _cmd_import_preview(["/import", "preview", parts[1]])  # legacy alias
 
             elif cmd == "/import-rollback":
                 _cmd_import_rollback(conn, bank, parts)

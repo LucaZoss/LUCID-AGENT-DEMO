@@ -7,5 +7,9 @@ pyfiglet>=1.0
 # Default demo uses Claude via ANTHROPIC_API_KEY:
 anthropic>=0.20
 
+# CSV parsing
+chardet>=4.0
+pandas>=2.0
+
 # Dev / test
 pytest>=7.0
