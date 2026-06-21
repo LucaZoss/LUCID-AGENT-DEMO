@@ -181,6 +181,32 @@ def _cmd_model(current_llm):
         return current_llm
 
 
+def _pick_account(bank: "DBBankingProvider") -> "str | None":
+    """Return an account_id: use the only account silently, or prompt when there are many."""
+    from contracts import Account
+    accounts: list[Account] = bank.get_accounts()
+    if not accounts:
+        _CONSOLE.print(f"[{_RED}]No accounts found.[/{_RED}]")
+        return None
+    if len(accounts) == 1:
+        return accounts[0].id
+    for i, acc in enumerate(accounts, 1):
+        _CONSOLE.print(
+            f"  [{_ACCENT}]{i:>2}[/{_ACCENT}]  {acc.name}  "
+            f"[{_DIM_TEXT}]{acc.account_type}[/{_DIM_TEXT}]  "
+            f"CHF {acc.balance:,.2f}"
+        )
+    try:
+        raw = _CONSOLE.input(f"[{_ACCENT}]Account number: [/{_ACCENT}]").strip()
+        idx = int(raw) - 1
+        if 0 <= idx < len(accounts):
+            return accounts[idx].id
+        _CONSOLE.print(f"[{_RED}]Number out of range.[/{_RED}]")
+    except (EOFError, KeyboardInterrupt, ValueError):
+        _CONSOLE.print(f"[{_DIM_TEXT}]Cancelled.[/{_DIM_TEXT}]")
+    return None
+
+
 # ── /account ───────────────────────────────────────────────────────────────────
 
 def _cmd_account(bank: DBBankingProvider) -> None:
@@ -395,11 +421,9 @@ def _cmd_fire(args: list[str], bank: DBBankingProvider, conn) -> None:
 
     merchant = " ".join(args[1:])
 
-    accounts = bank.get_accounts()
-    if not accounts:
-        _CONSOLE.print(f"[{_RED}]No accounts found.[/{_RED}]")
+    account_id = _pick_account(bank)
+    if account_id is None:
         return
-    account_id = accounts[0].id
 
     from tools.categorize import categorize_transaction
 
@@ -705,16 +729,21 @@ def _print_import_result(r: ImportResult) -> None:
     _CONSOLE.print(Panel(body.rstrip(), title="import", border_style=_ACCENT_DEEP))
 
 
-def _cmd_import_run(conn: sqlite3.Connection, bank: DBBankingProvider, parts: list[str]) -> None:
+def _cmd_import_run(
+    conn: sqlite3.Connection,
+    bank: DBBankingProvider,
+    parts: list[str],
+    llm=None,
+) -> None:
     """Guided single-file import OR batch import of all *.csv in LUCID_IMPORT_DIR."""
     global _PENDING_CSV_PREVIEW
-    force = any(p in ("--force", "force") for p in parts)
+    from ingest.account_detect import detect_and_confirm_account
+    from orchestrator.startup import (  # type: ignore[attr-defined]
+        _resolve_mapping_hitl,
+        _show_columns_and_get_mapping,
+    )
 
-    accounts = bank.get_accounts()
-    if not accounts:
-        _CONSOLE.print(f"[{_RED}]No account to import into.[/{_RED}]")
-        return
-    acc_id = accounts[0].id
+    force = any(p in ("--force", "force") for p in parts)
 
     # Find optional profile override.
     profile_id: str | None = None
@@ -722,6 +751,20 @@ def _cmd_import_run(conn: sqlite3.Connection, bank: DBBankingProvider, parts: li
         if p == "profile" and i + 1 < len(parts):
             profile_id = parts[i + 1]
             break
+
+    def _import_one(path: Path, *, mapping=None) -> None:
+        """Detect account, then import a single file."""
+        _CONSOLE.print(f"\n  [{_ACCENT}]Account for[/{_ACCENT}] [cyan]{path.name}[/cyan]")
+        acc_id = detect_and_confirm_account(_CONSOLE, llm, prev, conn, _USER_ID, path.name)
+        if acc_id is None:
+            _CONSOLE.print(f"  [{_DIM_TEXT}]Skipped {path.name} — no account selected.[/{_DIM_TEXT}]")
+            return
+        results = import_csv_files(
+            conn, _USER_ID, acc_id, [path],
+            mapping=mapping, profile_id=profile_id, force_reimport=force,
+        )
+        for r in results:
+            _print_import_result(r)
 
     # Single-file guided mode: /import <filename.csv>
     filename_arg = next(
@@ -738,37 +781,19 @@ def _cmd_import_run(conn: sqlite3.Connection, bank: DBBankingProvider, parts: li
 
         prev = preview_csv_file(path)
         _PENDING_CSV_PREVIEW = {"path": str(path), "preview": prev}
-        _render_preview_panel(prev)
 
-        det = prev["detection"]
-        if isinstance(det, MappingAmbiguity):
-            _CONSOLE.print(
-                f"[{_RED}]Cannot import — column mapping is ambiguous (see above).[/{_RED}]\n"
-                f"[{_DIM_TEXT}]Fix the CSV headers or save a custom mapping profile.[/{_DIM_TEXT}]"
-            )
-            return
-
-        try:
-            answer = _CONSOLE.input(
-                f"\n[{_ACCENT}]Import {path.name} into your ledger? [[bold]y[/bold]/N] [/{_ACCENT}]"
-            ).strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            _CONSOLE.print(f"[{_DIM_TEXT}]Import cancelled.[/{_DIM_TEXT}]")
-            return
-
-        if answer != "y":
-            _CONSOLE.print(f"[{_DIM_TEXT}]Import cancelled.[/{_DIM_TEXT}]")
-            return
-
-        results = import_csv_files(
-            conn, _USER_ID, acc_id, [path],
-            profile_id=profile_id, force_reimport=force,
+        # Always show all columns and ask the user to confirm/assign fields
+        mapping = _show_columns_and_get_mapping(
+            _CONSOLE, llm, path, prev, conn=conn, user_id=_USER_ID
         )
-        for r in results:
-            _print_import_result(r)
+        if mapping is None:
+            _CONSOLE.print(f"  [{_DIM_TEXT}]Import cancelled.[/{_DIM_TEXT}]")
+            return
+
+        _import_one(path, mapping=mapping)
         return
 
-    # Batch mode: /import (no filename)
+    # Batch mode: /import (no filename) — process each file individually
     d = _import_dir()
     csvs = sorted(d.glob("*.csv"))
     if not csvs:
@@ -782,11 +807,14 @@ def _cmd_import_run(conn: sqlite3.Connection, bank: DBBankingProvider, parts: li
     _CONSOLE.print(
         f"[{_DIM_TEXT}]Found {len(csvs)} file(s) in {d.resolve()} — importing…[/{_DIM_TEXT}]"
     )
-    results = import_csv_files(
-        conn, _USER_ID, acc_id, csvs, profile_id=profile_id, force_reimport=force,
-    )
-    for r in results:
-        _print_import_result(r)
+    for path in csvs:
+        prev = preview_csv_file(path)
+        _render_preview_panel(prev)
+        det = prev["detection"]
+        if isinstance(det, MappingAmbiguity):
+            _CONSOLE.print(f"  [{_RED}]Skipping {path.name} — mapping ambiguous.[/{_RED}]")
+            continue
+        _import_one(path, mapping=det)
 
 
 def _cmd_import_preview(parts: list[str]) -> None:
@@ -990,18 +1018,17 @@ def _cmd_txn_add(bank: DBBankingProvider, conn: sqlite3.Connection) -> None:
         _CONSOLE.print(f"[{_RED}]{exc}[/{_RED}]")
         return
 
-    accounts = bank.get_accounts()
-    if not accounts:
-        _CONSOLE.print(f"[{_RED}]No account found.[/{_RED}]")
+    account_id = _pick_account(bank)
+    if account_id is None:
         return
 
     dummy = Transaction(
-        id="x", account_id=accounts[0].id, amount=amount,
+        id="x", account_id=account_id, amount=amount,
         currency="CHF", merchant=merchant, category=None, ts=ts,
     )
     txn = Transaction(
         id=f"txn-{uuid.uuid4().hex[:8]}",
-        account_id=accounts[0].id,
+        account_id=account_id,
         amount=round(amount, 2),
         currency="CHF",
         merchant=merchant,
@@ -1227,7 +1254,7 @@ def main() -> None:
                 if sub == "preview":
                     _cmd_import_preview(parts)
                 else:
-                    _cmd_import_run(conn, bank, parts)
+                    _cmd_import_run(conn, bank, parts, llm)
 
             elif cmd == "/import-preview" and len(parts) >= 2:
                 _cmd_import_preview(["/import", "preview", parts[1]])  # legacy alias

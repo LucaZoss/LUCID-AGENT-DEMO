@@ -97,4 +97,63 @@ TOOL_DEFINITIONS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_transactions_by_bucket",
+            "description": (
+                "Return transactions filtered by budget label (need, want, or savings). "
+                "Use when the user asks about spending in a specific budget category, "
+                "e.g. 'show my needs', 'list my wants', 'what are my savings transfers'. "
+                "Returns count and a list of matching transactions."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "bucket": {
+                        "type": "string",
+                        "enum": ["need", "want", "savings"],
+                        "description": "The budget label to filter by.",
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": "Look-back window in days (default 90).",
+                        "default": 90,
+                    },
+                },
+                "required": ["bucket"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_transactions_by_category",
+            "description": (
+                "Return transactions filtered by raw bank category label "
+                "(e.g. 'Lebensmittel', 'Restaurant', 'Versicherung'). "
+                "Use when the user asks about a specific type of spending by its "
+                "bank-assigned category name, not the need/want/savings bucket. "
+                "Partial matches are supported (case-insensitive)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "description": (
+                            "Bank category label to search for. "
+                            "Partial strings work, e.g. 'groc' matches 'Groceries'."
+                        ),
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": "Look-back window in days (default 90).",
+                        "default": 90,
+                    },
+                },
+                "required": ["category"],
+            },
+        },
+    },
 ]

@@ -123,6 +123,16 @@ def _tc_to_openai_dict(tc: ToolCall) -> dict[str, Any]:
     }
 
 
+def _load_merchant_overrides(conn: sqlite3.Connection, user_id: str) -> dict[str, tuple[str | None, str | None]]:
+    """Return {merchant_normalized: (bucket, line_category)} for all known merchants."""
+    rows = conn.execute(
+        "SELECT merchant_normalized, bucket, line_category "
+        "FROM merchant_category_overrides WHERE user_id=?",
+        (user_id,),
+    ).fetchall()
+    return {r[0]: (r[1], r[2]) for r in rows}
+
+
 def run_ledger_categorizer(
     llm: LLMProvider,
     conn: sqlite3.Connection,
@@ -136,9 +146,34 @@ def run_ledger_categorizer(
     if not txns:
         return "No uncategorized outflow transactions to process."
 
+    # Pre-fill proposals for merchants we already know, skipping them from the LLM batch.
+    overrides = _load_merchant_overrides(conn, user_id)
+    unknown_txns = []
+    pre_filled = 0
+    for t in txns:
+        key = t["merchant"].lower().strip()
+        if key in overrides:
+            bucket, line = overrides[key]
+            if bucket:
+                ledger_tools.propose_spending_bucket(
+                    conn, user_id, t["txn_id"], t["merchant"], bucket,
+                    rationale="merchant memory",
+                )
+            if line:
+                ledger_tools.propose_line_category(
+                    conn, user_id, t["txn_id"], t["merchant"], line,
+                    rationale="merchant memory",
+                )
+            pre_filled += 1
+        else:
+            unknown_txns.append(t)
+
+    if not unknown_txns:
+        return f"All {pre_filled} transaction(s) pre-filled from merchant memory."
+
     lines = "\n".join(
         f"- id={t['txn_id']} merchant={t['merchant']!r} amount={t['amount']} ts={t['ts']}"
-        for t in txns
+        for t in unknown_txns
     )
     user_block = (
         "Classify each transaction below. For each one, call propose_spending_bucket "
@@ -158,6 +193,8 @@ def run_ledger_categorizer(
         )
         if resp.stop_reason == "end_turn" or not resp.tool_calls:
             summary = resp.content or "Done (no further tool calls)."
+            if pre_filled:
+                summary = f"{pre_filled} pre-filled from merchant memory. " + summary
             return summary
 
         messages.append({
@@ -174,4 +211,5 @@ def run_ledger_categorizer(
                 "content": json.dumps(result),
             })
 
-    return "(ledger categorizer reached iteration limit)"
+    suffix = f" ({pre_filled} pre-filled from merchant memory)" if pre_filled else ""
+    return f"(ledger categorizer reached iteration limit){suffix}"

@@ -17,7 +17,7 @@ def list_profiles(conn: sqlite3.Connection, user_id: str) -> list[dict[str, Any]
     """Return all mapping profiles for the user."""
     rows = conn.execute(
         "SELECT id, display_name, column_map, sign_rule, encoding, delimiter, "
-        "header_hash, is_default, created_at, updated_at "
+        "header_hash, is_default, created_at, updated_at, category_col "
         "FROM csv_mapping_profiles WHERE user_id=? ORDER BY updated_at DESC",
         (user_id,),
     ).fetchall()
@@ -34,6 +34,7 @@ def list_profiles(conn: sqlite3.Connection, user_id: str) -> list[dict[str, Any]
             "is_default": bool(r[7]),
             "created_at": r[8],
             "updated_at": r[9],
+            "category_col": r[10],
         })
     return out
 
@@ -41,7 +42,8 @@ def list_profiles(conn: sqlite3.Connection, user_id: str) -> list[dict[str, Any]
 def get_profile(conn: sqlite3.Connection, profile_id: str) -> dict[str, Any] | None:
     row = conn.execute(
         "SELECT id, user_id, display_name, column_map, sign_rule, encoding, "
-        "delimiter, header_hash, is_default FROM csv_mapping_profiles WHERE id=?",
+        "delimiter, header_hash, is_default, category_col "
+        "FROM csv_mapping_profiles WHERE id=?",
         (profile_id,),
     ).fetchone()
     if not row:
@@ -56,6 +58,7 @@ def get_profile(conn: sqlite3.Connection, profile_id: str) -> dict[str, Any] | N
         "delimiter": row[6],
         "header_hash": row[7],
         "is_default": bool(row[8]),
+        "category_col": row[9],
     }
 
 
@@ -64,7 +67,8 @@ def find_profile_by_header_hash(
 ) -> dict[str, Any] | None:
     row = conn.execute(
         "SELECT id, user_id, display_name, column_map, sign_rule, encoding, "
-        "delimiter, header_hash, is_default FROM csv_mapping_profiles "
+        "delimiter, header_hash, is_default, category_col "
+        "FROM csv_mapping_profiles "
         "WHERE user_id=? AND header_hash=? ORDER BY updated_at DESC LIMIT 1",
         (user_id, header_hash),
     ).fetchone()
@@ -80,6 +84,7 @@ def find_profile_by_header_hash(
         "delimiter": row[6],
         "header_hash": row[7],
         "is_default": bool(row[8]),
+        "category_col": row[9],
     }
 
 
@@ -93,6 +98,7 @@ def save_profile(
     encoding: str,
     delimiter: str,
     headers: list[str],
+    category_col: str | None = None,
 ) -> str:
     """Insert a new profile; returns profile id."""
     now = datetime.now(timezone.utc).isoformat()
@@ -101,8 +107,8 @@ def save_profile(
     conn.execute(
         "INSERT INTO csv_mapping_profiles("
         "id, user_id, display_name, column_map, sign_rule, encoding, delimiter, "
-        "header_hash, is_default, created_at, updated_at"
-        ") VALUES (?,?,?,?,?,?,?,?,0,?,?)",
+        "header_hash, is_default, created_at, updated_at, category_col"
+        ") VALUES (?,?,?,?,?,?,?,?,0,?,?,?)",
         (
             pid,
             user_id,
@@ -114,6 +120,7 @@ def save_profile(
             hhash,
             now,
             now,
+            category_col,
         ),
     )
     conn.commit()
@@ -129,6 +136,7 @@ def update_profile_column_map(
     encoding: str | None = None,
     delimiter: str | None = None,
     headers: list[str] | None = None,
+    category_col: str | None = None,
 ) -> bool:
     """Update an existing profile's JSON mapping."""
     now = datetime.now(timezone.utc).isoformat()
@@ -143,13 +151,14 @@ def update_profile_column_map(
     if hhash and encoding is not None:
         conn.execute(
             "UPDATE csv_mapping_profiles SET column_map=?, sign_rule=?, "
-            "encoding=?, delimiter=?, header_hash=?, updated_at=? WHERE id=?",
+            "encoding=?, delimiter=?, header_hash=?, category_col=?, updated_at=? WHERE id=?",
             (
                 json.dumps(column_map),
                 sign_rule,
                 encoding,
                 delim,
                 hhash,
+                category_col,
                 now,
                 profile_id,
             ),
@@ -157,11 +166,12 @@ def update_profile_column_map(
     elif hhash:
         conn.execute(
             "UPDATE csv_mapping_profiles SET column_map=?, sign_rule=?, "
-            "header_hash=?, updated_at=? WHERE id=?",
+            "header_hash=?, category_col=?, updated_at=? WHERE id=?",
             (
                 json.dumps(column_map),
                 sign_rule,
                 hhash,
+                category_col,
                 now,
                 profile_id,
             ),
@@ -169,10 +179,11 @@ def update_profile_column_map(
     else:
         conn.execute(
             "UPDATE csv_mapping_profiles SET column_map=?, sign_rule=?, "
-            "updated_at=? WHERE id=?",
+            "category_col=?, updated_at=? WHERE id=?",
             (
                 json.dumps(column_map),
                 sign_rule,
+                category_col,
                 now,
                 profile_id,
             ),

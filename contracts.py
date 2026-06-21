@@ -33,6 +33,8 @@ class Account:
     name: str
     balance: float
     currency: str = "CHF"
+    account_type: str = "checking"   # checking | credit_card | savings
+    has_income: bool = False
 
 
 @dataclass

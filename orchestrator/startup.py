@@ -146,14 +146,44 @@ def _resolve_mapping_hitl(
     console,
     llm,
     preview: dict,
+    conn: "sqlite3.Connection | None" = None,
+    user_id: str | None = None,
 ) -> "ResolvedColumnMapping | None":
-    """Three-step escalation: LLM fallback → manual column selection → skip."""
+    """Three-step escalation: LLM fallback → manual column selection → skip.
+
+    When *conn* and *user_id* are provided, offers to save a successful
+    resolution as a reusable profile (so the header-hash auto-reload path
+    gets populated).
+    """
     from ingest.csv_detect import LucidField, ResolvedColumnMapping
     from agents.csv_mapper import resolve_mapping_with_llm
 
     headers: list[str] = preview["headers"]
     encoding: str = preview.get("encoding", "utf-8")
     delimiter: str = preview.get("delimiter", ",")
+
+    def _maybe_save_profile(mapping: "ResolvedColumnMapping", default_name: str) -> None:
+        if conn is None or user_id is None:
+            return
+        try:
+            from rich.prompt import Confirm
+            save = Confirm.ask("  Save this mapping as a profile for future imports?", default=False)
+        except (EOFError, KeyboardInterrupt):
+            return
+        if not save:
+            return
+        try:
+            name_in = console.input(f"  Profile name [[bold]{default_name}[/bold]]: ").strip()
+            display_name = name_in or default_name
+        except (EOFError, KeyboardInterrupt):
+            return
+        from ingest.profiles import save_profile
+        pid = save_profile(
+            conn, user_id, display_name, mapping.column_map,
+            sign_rule=mapping.sign_rule, encoding=mapping.encoding,
+            delimiter=mapping.delimiter, headers=headers,
+        )
+        console.print(f"  [green]Profile saved (id: {pid})[/green]")
 
     # Step 1 — LLM fallback
     console.print("\n  [dim]Trying LLM to resolve mapping…[/dim]")
@@ -166,6 +196,7 @@ def _resolve_mapping_hitl(
         except (EOFError, KeyboardInterrupt):
             ok = True
         if ok:
+            _maybe_save_profile(mapping, "LLM resolved")
             return mapping
     except Exception as exc:
         console.print(f"  [yellow]LLM mapping failed: {exc}[/yellow]")
@@ -237,12 +268,206 @@ def _resolve_mapping_hitl(
             column_map[LucidField.CREDIT.value] = cred_col
         sign_rule = "debit_credit"
 
-    return ResolvedColumnMapping(
+    mapping = ResolvedColumnMapping(
         column_map=column_map,
         sign_rule=sign_rule,
         encoding=encoding,
         delimiter=delimiter,
     )
+    _maybe_save_profile(mapping, "manual")
+    return mapping
+
+
+# ── Primary column-assignment UI (always shown) ──────────────────────────────
+
+def _show_columns_and_get_mapping(
+    console,
+    llm,
+    path: "Path",
+    preview: dict,
+    conn: "sqlite3.Connection | None" = None,
+    user_id: str | None = None,
+) -> "ResolvedColumnMapping | None":
+    """Show all CSV columns with samples, ask user to assign each field.
+
+    Auto-detection runs silently and its results are shown as bracketed
+    defaults.  The user can accept by pressing Enter or type a different
+    column number (1-based) or exact header name.
+
+    Returns a ResolvedColumnMapping (with category_col if the user picked one)
+    or None if the user chose to skip this file.
+    """
+    from rich.table import Table
+    from ingest.csv_detect import LucidField, MappingAmbiguity, ResolvedColumnMapping
+
+    headers: list[str] = preview["headers"]
+    sample_rows: list[dict] = preview.get("sample_rows", [])[:3]
+    encoding: str = preview.get("encoding", "utf-8")
+    delimiter: str = preview.get("delimiter", ",")
+    detected = preview.get("detection")
+
+    # ── Step A: display all columns with samples ──────────────────────────────
+    console.print(f"\n[bold]Columns in[/bold] [cyan]{path.name}[/cyan]\n")
+    tbl = Table(box=None, show_header=True, padding=(0, 1))
+    tbl.add_column("#", style="bold cyan", width=4)
+    tbl.add_column("Column name", style="bold")
+    tbl.add_column("Sample 1", style="dim", overflow="fold", max_width=22)
+    tbl.add_column("Sample 2", style="dim", overflow="fold", max_width=22)
+    tbl.add_column("Sample 3", style="dim", overflow="fold", max_width=22)
+
+    for i, h in enumerate(headers, 1):
+        samples = [str(r.get(h, "")).strip()[:22] for r in sample_rows]
+        while len(samples) < 3:
+            samples.append("")
+        tbl.add_row(str(i), h, samples[0], samples[1], samples[2])
+    console.print(tbl)
+
+    # ── Step B: derive defaults from auto-detection ───────────────────────────
+    def _default_for(lucid_key: str) -> tuple[int | None, str | None]:
+        if isinstance(detected, MappingAmbiguity):
+            col_name = detected.best_effort.get(lucid_key)
+        elif detected is not None:
+            col_name = detected.column_map.get(lucid_key)
+        else:
+            col_name = None
+        if col_name and col_name in headers:
+            return headers.index(col_name) + 1, col_name
+        return None, None
+
+    detected_sign_rule: str = (
+        detected.sign_rule if not isinstance(detected, MappingAmbiguity) and detected else "single_amount"
+    )
+
+    # ── Step C: interactive column picker ────────────────────────────────────
+    def _pick(prompt_label: str, required: bool = True, default_idx: int | None = None, default_name: str | None = None) -> str | None:
+        default_hint = f" [[bold]{default_idx} '{default_name}'[/bold], Enter to use]" if default_idx else ""
+        while True:
+            try:
+                raw = console.input(f"  {prompt_label}{default_hint} › ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return None
+            if raw.lower() == "skip":
+                return "SKIP"
+            if raw == "":
+                if default_idx is not None:
+                    return headers[default_idx - 1]
+                if not required:
+                    return None
+                console.print("  [red]Required — enter a column number or name.[/red]")
+                continue
+            if raw.isdigit():
+                idx = int(raw) - 1
+                if 0 <= idx < len(headers):
+                    return headers[idx]
+                console.print(f"  [red]Number out of range (1–{len(headers)}).[/red]")
+            elif raw in headers:
+                return raw
+            else:
+                console.print(f"  [red]Not found. Enter a number (1–{len(headers)}) or exact column name.[/red]")
+
+    # Date
+    d_idx, d_name = _default_for(LucidField.DATE.value)
+    date_col = _pick("Date column [required]", required=True, default_idx=d_idx, default_name=d_name)
+    if date_col == "SKIP" or date_col is None:
+        return None
+
+    # Merchant
+    m_idx, m_name = _default_for(LucidField.MERCHANT.value)
+    merchant_col = _pick("Merchant/description column [required]", required=True, default_idx=m_idx, default_name=m_name)
+    if merchant_col == "SKIP" or merchant_col is None:
+        return None
+
+    # Amount vs Debit/Credit — suggest based on auto-detected sign_rule
+    if detected_sign_rule == "debit_credit":
+        console.print("  Amount source: [1] Single amount column  [bold][2] Debit + Credit columns (detected)[/bold]")
+        default_amt_choice = 2
+    else:
+        console.print("  Amount source: [bold][1] Single amount column (detected)[/bold]  [2] Debit + Credit columns")
+        default_amt_choice = 1
+
+    try:
+        from rich.prompt import IntPrompt
+        amt_choice = IntPrompt.ask("  Choice", choices=["1", "2"], default=default_amt_choice)
+    except (EOFError, KeyboardInterrupt):
+        amt_choice = default_amt_choice
+
+    column_map: dict[str, str] = {
+        LucidField.DATE.value: date_col,
+        LucidField.MERCHANT.value: merchant_col,
+    }
+
+    if amt_choice == 1:
+        a_idx, a_name = _default_for(LucidField.AMOUNT.value)
+        amt_col = _pick("Amount column [required]", required=True, default_idx=a_idx, default_name=a_name)
+        if amt_col == "SKIP" or amt_col is None:
+            return None
+        column_map[LucidField.AMOUNT.value] = amt_col
+        # Re-infer sign_rule from the user's actual column choice
+        if not isinstance(detected, MappingAmbiguity) and detected and detected_sign_rule == "single_amount_flipped" and amt_col == a_name:
+            sign_rule = "single_amount_flipped"
+        else:
+            sign_rule = "single_amount"
+    else:
+        deb_idx, deb_name = _default_for(LucidField.DEBIT.value)
+        deb_col = _pick("Debit column (outflows, positive CHF) [required]", required=True, default_idx=deb_idx, default_name=deb_name)
+        if deb_col == "SKIP" or deb_col is None:
+            return None
+        cred_idx, cred_name = _default_for(LucidField.CREDIT.value)
+        cred_col = _pick("Credit column (inflows) [optional, Enter to skip]", required=False, default_idx=cred_idx, default_name=cred_name)
+        if cred_col == "SKIP":
+            return None
+        column_map[LucidField.DEBIT.value] = deb_col
+        if cred_col:
+            column_map[LucidField.CREDIT.value] = cred_col
+        sign_rule = "debit_credit"
+
+    # Category (optional)
+    console.print("  [dim]Category column — stores the bank's raw label (e.g. 'Lebensmittel')"
+                  " as a hint for the categorizer.[/dim]")
+    cat_col = _pick("Category column [optional, Enter or 'skip' to skip]", required=False)
+    if cat_col == "SKIP":
+        cat_col = None
+
+    mapping = ResolvedColumnMapping(
+        column_map=column_map,
+        sign_rule=sign_rule,
+        encoding=encoding,
+        delimiter=delimiter,
+        category_col=cat_col,
+    )
+
+    # ── Step D: show summary and offer profile save ───────────────────────────
+    console.print()
+    _show_mapping_preview(console, path, preview, mapping)
+
+    def _maybe_save_profile(default_name: str) -> None:
+        if conn is None or user_id is None:
+            return
+        try:
+            from rich.prompt import Confirm
+            save = Confirm.ask("  Save this mapping as a profile for future imports?", default=False)
+        except (EOFError, KeyboardInterrupt):
+            return
+        if not save:
+            return
+        try:
+            name_in = console.input(f"  Profile name [[bold]{default_name}[/bold]]: ").strip()
+            display_name = name_in or default_name
+        except (EOFError, KeyboardInterrupt):
+            return
+        from ingest.profiles import save_profile
+        pid = save_profile(
+            conn, user_id, display_name, mapping.column_map,
+            sign_rule=mapping.sign_rule,
+            encoding=mapping.encoding,
+            delimiter=mapping.delimiter,
+            headers=headers,
+            category_col=mapping.category_col,
+        )
+        console.print(f"  [green]Profile saved (id: {pid})[/green]")
+
+    _maybe_save_profile(path.stem)
+    return mapping
 
 
 # ── Stage 4: CSV import ───────────────────────────────────────────────────────
@@ -252,11 +477,11 @@ def stage_import(
     llm,
     conn: sqlite3.Connection,
     user_id: str,
-    account_id: str,
 ) -> list:
     """Prompt for file paths, parse and import CSVs. Returns list[ImportResult]."""
     from ingest.csv_detect import MappingAmbiguity
     from ingest.importer import import_csv_files, preview_csv_file
+    from ingest.account_detect import detect_and_confirm_account
 
     console.print(
         "\n[bold]Enter CSV file paths to import[/bold] "
@@ -283,29 +508,23 @@ def stage_import(
     all_results = []
     for path in paths:
         prev = preview_csv_file(path)
-        det = prev["detection"]
 
-        # Always show what was detected — never import silently
-        _show_mapping_preview(console, path, prev, det)
+        # Always show columns and ask the user to confirm/assign all fields
+        mapping = _show_columns_and_get_mapping(
+            console, llm, path, prev, conn=conn, user_id=user_id
+        )
+        if mapping is None:
+            console.print(f"  [yellow]Skipping {path.name}[/yellow]")
+            continue
 
-        if isinstance(det, MappingAmbiguity):
-            mapping = _resolve_mapping_hitl(console, llm, prev)
-            if mapping is None:
-                console.print(f"  [yellow]Skipping {path.name}[/yellow]")
-                continue
-        else:
-            try:
-                from rich.prompt import Confirm
-                ok = Confirm.ask("  Proceed with this mapping?", default=True)
-            except (EOFError, KeyboardInterrupt):
-                ok = True
-            if ok:
-                mapping = det
-            else:
-                mapping = _resolve_mapping_hitl(console, llm, prev)
-                if mapping is None:
-                    console.print(f"  [yellow]Skipping {path.name}[/yellow]")
-                    continue
+        # Per-file account detection
+        console.print(f"\n  [bold]Account for[/bold] [cyan]{path.name}[/cyan]")
+        account_id = detect_and_confirm_account(
+            console, llm, prev, conn, user_id, path.name
+        )
+        if account_id is None:
+            console.print(f"  [yellow]Skipping {path.name} — no account selected.[/yellow]")
+            continue
 
         results = import_csv_files(
             conn, user_id, account_id, [path], mapping=mapping,
@@ -372,20 +591,31 @@ def stage_summary(console, conn: sqlite3.Connection, user_id: str) -> None:
 
     txns = _fetch_transactions(conn, user_id, 90)
     if txns:
-        try:
-            s = compute_split(txns)
+        income_account_count = conn.execute(
+            "SELECT COUNT(*) FROM accounts WHERE user_id=? AND has_income=1",
+            (user_id,),
+        ).fetchone()[0]
+        if not income_account_count:
             console.print(
-                f"\n  [bold]90-day window[/bold]\n"
-                f"  Income:   CHF [bold]{s.income_chf:,.2f}[/bold]\n"
-                f"  Needs:    {s.needs_pct:.1f}%  (CHF {s.needs_chf:,.2f})\n"
-                f"  Wants:    {s.wants_pct:.1f}%  (CHF {s.wants_chf:,.2f})\n"
-                f"  Savings:  {s.savings_pct:.1f}%  (CHF {s.savings_chf:,.2f})"
+                "\n  [yellow]No income-bearing account on file.[/yellow]\n"
+                "  Import a checking or salary account and mark it income-bearing\n"
+                "  to see needs/wants/savings split ratios."
             )
-        except ValueError:
-            console.print(
-                "  [dim]No income transactions in the last 90 days — "
-                "split ratios not available.[/dim]"
-            )
+        else:
+            try:
+                s = compute_split(txns)
+                console.print(
+                    f"\n  [bold]90-day window[/bold]\n"
+                    f"  Income:   CHF [bold]{s.income_chf:,.2f}[/bold]\n"
+                    f"  Needs:    {s.needs_pct:.1f}%  (CHF {s.needs_chf:,.2f})\n"
+                    f"  Wants:    {s.wants_pct:.1f}%  (CHF {s.wants_chf:,.2f})\n"
+                    f"  Savings:  {s.savings_pct:.1f}%  (CHF {s.savings_chf:,.2f})"
+                )
+            except ValueError:
+                console.print(
+                    "  [dim]No income transactions in the last 90 days — "
+                    "split ratios not available.[/dim]"
+                )
     else:
         console.print("  [dim]No transactions in the last 90 days.[/dim]")
 
@@ -456,9 +686,10 @@ def _seed_demo(
         (user_id, "Demo User", now.isoformat()),
     )
     conn.execute(
-        "INSERT OR IGNORE INTO accounts(id, user_id, name, balance, currency) "
-        "VALUES(?,?,?,?,?)",
-        (account_id, user_id, "Zürcher Kantonalbank Checking", 3200.00, "CHF"),
+        "INSERT OR IGNORE INTO accounts"
+        "(id, user_id, name, balance, currency, account_type, has_income) "
+        "VALUES(?,?,?,?,?,?,?)",
+        (account_id, user_id, "Zürcher Kantonalbank Checking", 3200.00, "CHF", "checking", 1),
     )
     conn.execute(
         "INSERT OR IGNORE INTO conversations(id, user_id, started_at) VALUES(?,?,?)",
@@ -545,7 +776,7 @@ def run_startup(console, model_override: str | None = None) -> StartupState:
     if state.data_source == "csv":
         # Stage 4 — Import
         state.stage = StartupStage.IMPORT
-        stage_import(console, state.llm, state.conn, USER_ID, ACCOUNT_ID)
+        stage_import(console, state.llm, state.conn, USER_ID)
 
         # Stage 5 — Categorize
         state.stage = StartupStage.CATEGORIZE

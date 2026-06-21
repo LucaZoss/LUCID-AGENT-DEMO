@@ -158,6 +158,7 @@ def import_csv_files(
                     sign_rule=p["sign_rule"] or "single_amount",
                     encoding=p["encoding"] or enc,
                     delimiter=p["delimiter"] or delim,
+                    category_col=p.get("category_col"),
                 )
                 used_profile = profile_id
 
@@ -170,6 +171,7 @@ def import_csv_files(
                     sign_rule=p2["sign_rule"] or "single_amount",
                     encoding=p2["encoding"] or enc,
                     delimiter=p2["delimiter"] or delim,
+                    category_col=p2.get("category_col"),
                 )
                 used_profile = p2["id"]
 
@@ -253,6 +255,15 @@ def import_csv_files(
             if amt > 0:
                 income_seen = True
 
+            # Read raw bank category label verbatim → stored as line_category hint
+            # for the LLM categorizer. Never overwrites the category (need/want/savings)
+            # bucket — that is determined by the categorizer after import.
+            csv_line_category: str | None = None
+            if resolved.category_col:
+                raw_cat = str(row.get(resolved.category_col, "")).strip()
+                if raw_cat:
+                    csv_line_category = raw_cat
+
             fp = row_fingerprint(ts, amt, merchant)
             exists = conn.execute(
                 "SELECT 1 FROM transactions WHERE account_id=? AND external_fingerprint=?",
@@ -275,7 +286,7 @@ def import_csv_files(
                     "CHF",
                     merchant,
                     None,
-                    None,
+                    csv_line_category,
                     ts.isoformat(),
                     batch_id,
                     fp,

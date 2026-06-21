@@ -216,6 +216,23 @@ def apply_proposal(
         "AND status='pending'",
         (txn_id, proposal_id),
     )
+    # Record merchant → category mapping so future imports pre-fill proposals.
+    merchant_row = conn.execute(
+        "SELECT lower(trim(merchant)) FROM transactions WHERE id=?", (txn_id,)
+    ).fetchone()
+    if merchant_row and (bucket or line):
+        merchant_norm = merchant_row[0]
+        conn.execute(
+            "INSERT OR REPLACE INTO merchant_category_overrides "
+            "(id, user_id, merchant_normalized, bucket, line_category, updated_at) "
+            "VALUES ("
+            "  COALESCE("
+            "    (SELECT id FROM merchant_category_overrides"
+            "     WHERE user_id=? AND merchant_normalized=?),"
+            "    lower(hex(randomblob(16)))"
+            "  ), ?, ?, ?, ?, datetime('now'))",
+            (user_id, merchant_norm, user_id, merchant_norm, bucket or None, line or None),
+        )
     conn.commit()
     return {"ok": True, "txn_id": txn_id, "category": bucket or None, "line_category": line}
 

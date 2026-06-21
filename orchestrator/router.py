@@ -184,6 +184,54 @@ def _dispatch_tool(
         category = tools_module.categorize_transaction(dummy)
         return {"merchant": merchant, "category": category}
 
+    if name == "get_transactions_by_bucket":
+        from db.queries import get_transactions_by_bucket
+        bucket = args.get("bucket", "")
+        days = int(args.get("days", 90))
+        try:
+            txns = get_transactions_by_bucket(conn, user_id, bucket, days=days)
+            return {
+                "bucket": bucket,
+                "days": days,
+                "count": len(txns),
+                "transactions": [
+                    {
+                        "id": t.id,
+                        "merchant": t.merchant,
+                        "amount": t.amount,
+                        "line_category": t.line_category,
+                        "ts": t.ts.date().isoformat(),
+                    }
+                    for t in txns
+                ],
+            }
+        except ValueError as exc:
+            return {"error": str(exc)}
+
+    if name == "get_transactions_by_category":
+        from db.queries import get_transactions_by_line_category
+        category = args.get("category", "")
+        days = int(args.get("days", 90))
+        try:
+            txns = get_transactions_by_line_category(conn, user_id, category, days=days)
+            return {
+                "category": category,
+                "days": days,
+                "count": len(txns),
+                "transactions": [
+                    {
+                        "id": t.id,
+                        "merchant": t.merchant,
+                        "amount": t.amount,
+                        "bucket": t.category,
+                        "ts": t.ts.date().isoformat(),
+                    }
+                    for t in txns
+                ],
+            }
+        except ValueError as exc:
+            return {"error": str(exc)}
+
     return {"error": f"Unknown tool: '{name}'"}
 
 

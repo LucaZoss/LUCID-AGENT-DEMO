@@ -96,7 +96,9 @@ CREATE TABLE IF NOT EXISTS accounts (
     user_id         TEXT NOT NULL REFERENCES users(id),
     name            TEXT NOT NULL,
     balance         REAL NOT NULL,
-    currency        TEXT NOT NULL DEFAULT 'CHF'
+    currency        TEXT NOT NULL DEFAULT 'CHF',
+    account_type    TEXT NOT NULL DEFAULT 'checking',  -- checking | credit_card | savings
+    has_income      INTEGER NOT NULL DEFAULT 0          -- 1 = salary / regular income present
 );
 
 CREATE TABLE IF NOT EXISTS transactions (
@@ -209,7 +211,7 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
 
 def migrate_schema(conn: sqlite3.Connection) -> None:
     """Apply additive migrations for DBs created before ingest / HIL tables."""
-    # New standalone tables (CREATE IF NOT EXISTS already ran in SCHEMA)
+    # transactions columns added in the ingest phase
     cols = _table_columns(conn, "transactions")
     if "line_category" not in cols:
         conn.execute("ALTER TABLE transactions ADD COLUMN line_category TEXT")
@@ -225,6 +227,27 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
         "ON transactions(account_id, external_fingerprint) "
         "WHERE external_fingerprint IS NOT NULL"
     )
+    # csv_mapping_profiles columns added for category support (table may not
+    # exist in very old DBs — the CREATE TABLE IF NOT EXISTS in SCHEMA covers it)
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "csv_mapping_profiles" in tables:
+        prof_cols = _table_columns(conn, "csv_mapping_profiles")
+        if "category_col" not in prof_cols:
+            conn.execute(
+                "ALTER TABLE csv_mapping_profiles ADD COLUMN category_col TEXT"
+            )
+    # accounts columns added for multi-account support
+    acct_cols = _table_columns(conn, "accounts")
+    if "account_type" not in acct_cols:
+        conn.execute(
+            "ALTER TABLE accounts ADD COLUMN "
+            "account_type TEXT NOT NULL DEFAULT 'checking'"
+        )
+    if "has_income" not in acct_cols:
+        conn.execute(
+            "ALTER TABLE accounts ADD COLUMN "
+            "has_income INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 def init_db(path: str = "finance_agent.db") -> sqlite3.Connection:

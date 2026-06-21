@@ -28,6 +28,7 @@ class LucidField(str, Enum):
     CREDIT = "credit"
     REFERENCE = "reference"
     CURRENCY = "currency"
+    CATEGORY = "category"
 
 
 # (pattern substring, weight) — checked on normalized header (lower, stripped)
@@ -160,6 +161,7 @@ class ResolvedColumnMapping:
     sign_rule: str  # single_amount | debit_credit
     encoding: str
     delimiter: str
+    category_col: str | None = None  # raw bank category label → stored as line_category
 
 
 def header_row_hash(headers: list[str], delimiter: str) -> str:

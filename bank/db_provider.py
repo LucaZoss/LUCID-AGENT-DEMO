@@ -31,12 +31,15 @@ class DBBankingProvider(BankingProvider):
 
     def get_accounts(self) -> list[Account]:
         rows = self._conn.execute(
-            "SELECT id, user_id, name, balance, currency "
+            "SELECT id, user_id, name, balance, currency, account_type, has_income "
             "FROM accounts WHERE user_id=?",
             (self._user_id,),
         ).fetchall()
         return [
-            Account(id=r[0], user_id=r[1], name=r[2], balance=r[3], currency=r[4])
+            Account(
+                id=r[0], user_id=r[1], name=r[2], balance=r[3], currency=r[4],
+                account_type=r[5] or "checking", has_income=bool(r[6]),
+            )
             for r in rows
         ]
 
