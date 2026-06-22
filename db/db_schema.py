@@ -70,6 +70,10 @@ CREATE TABLE IF NOT EXISTS csv_mapping_profiles (
     delimiter       TEXT DEFAULT ',',
     header_hash     TEXT,             -- sha256 of normalized header row for match
     is_default      INTEGER DEFAULT 0,
+    -- ETL agent memory fields
+    source_label    TEXT,             -- user-visible format name e.g. "Mastercard CH"
+    confirmed       INTEGER DEFAULT 0, -- 1 = user explicitly confirmed this mapping
+    use_count       INTEGER DEFAULT 0, -- number of successful imports using this profile
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
@@ -107,6 +111,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     amount          REAL NOT NULL,    -- negative = outflow
     currency        TEXT NOT NULL DEFAULT 'CHF',
     merchant        TEXT NOT NULL,
+    clean_name      TEXT,             -- normalised merchant name set by Labeller agent
     category        TEXT,             -- need|want|savings, set by categorizer
     line_category   TEXT,            -- rent|groceries|… (optional fine label)
     ts              TEXT NOT NULL,
@@ -134,9 +139,15 @@ CREATE INDEX IF NOT EXISTS idx_cat_prop_user_status ON category_proposals(user_i
 CREATE TABLE IF NOT EXISTS merchant_category_overrides (
     id                  TEXT PRIMARY KEY,
     user_id             TEXT NOT NULL REFERENCES users(id),
-    merchant_normalized TEXT NOT NULL,
-    bucket              TEXT,         -- need|want|savings
+    merchant_normalized TEXT NOT NULL,  -- raw pattern matched against transaction merchant
+    canonical_name      TEXT,           -- clean display name set by Labeller agent
+    bucket              TEXT,           -- need|want|savings
     line_category       TEXT,
+    -- Labeller agent memory fields
+    source              TEXT NOT NULL DEFAULT 'user_confirmed',
+                        -- 'user_confirmed' | 'sector_rule' | 'llm_proposed'
+    confidence          REAL NOT NULL DEFAULT 1.0,  -- 0.0–1.0; user_confirmed=1.0
+    override_count      INTEGER NOT NULL DEFAULT 0, -- times user manually changed the suggestion
     updated_at          TEXT NOT NULL,
     UNIQUE(user_id, merchant_normalized)
 );
@@ -221,6 +232,10 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE transactions ADD COLUMN external_fingerprint TEXT"
         )
+    # Sub-plan 1: clean_name column for Labeller agent
+    if "clean_name" not in cols:
+        conn.execute("ALTER TABLE transactions ADD COLUMN clean_name TEXT")
+
     # Partial unique index (may fail on very old SQLite — ignore if exists)
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_txn_fingerprint "
@@ -236,6 +251,46 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "ALTER TABLE csv_mapping_profiles ADD COLUMN category_col TEXT"
             )
+        # Sub-plan 1: ETL agent memory fields on csv_mapping_profiles
+        if "source_label" not in prof_cols:
+            conn.execute(
+                "ALTER TABLE csv_mapping_profiles ADD COLUMN source_label TEXT"
+            )
+        if "confirmed" not in prof_cols:
+            conn.execute(
+                "ALTER TABLE csv_mapping_profiles "
+                "ADD COLUMN confirmed INTEGER DEFAULT 0"
+            )
+        if "use_count" not in prof_cols:
+            conn.execute(
+                "ALTER TABLE csv_mapping_profiles "
+                "ADD COLUMN use_count INTEGER DEFAULT 0"
+            )
+
+    # merchant_category_overrides: Sub-plan 1 Labeller agent memory fields
+    if "merchant_category_overrides" in tables:
+        mco_cols = _table_columns(conn, "merchant_category_overrides")
+        if "canonical_name" not in mco_cols:
+            conn.execute(
+                "ALTER TABLE merchant_category_overrides "
+                "ADD COLUMN canonical_name TEXT"
+            )
+        if "source" not in mco_cols:
+            conn.execute(
+                "ALTER TABLE merchant_category_overrides "
+                "ADD COLUMN source TEXT NOT NULL DEFAULT 'user_confirmed'"
+            )
+        if "confidence" not in mco_cols:
+            conn.execute(
+                "ALTER TABLE merchant_category_overrides "
+                "ADD COLUMN confidence REAL NOT NULL DEFAULT 1.0"
+            )
+        if "override_count" not in mco_cols:
+            conn.execute(
+                "ALTER TABLE merchant_category_overrides "
+                "ADD COLUMN override_count INTEGER NOT NULL DEFAULT 0"
+            )
+
     # accounts columns added for multi-account support
     acct_cols = _table_columns(conn, "accounts")
     if "account_type" not in acct_cols:

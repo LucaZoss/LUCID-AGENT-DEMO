@@ -291,6 +291,141 @@ def test_import_ubs_mastercard_format(conn, tmp_path: Path) -> None:
     assert round(sum(amounts), 2) == round(-(55.62 + 4.59 + 12.00), 2)
 
 
+# ── Sub-plan 1: schema migration column tests ──────────────────────────────────
+
+
+def test_transactions_has_clean_name_column(conn) -> None:
+    """transactions.clean_name column must exist after init_db()."""
+    cols = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(transactions)").fetchall()
+    }
+    assert "clean_name" in cols, f"clean_name missing from transactions; got: {cols}"
+
+
+def test_csv_mapping_profiles_has_etl_memory_columns(conn) -> None:
+    """csv_mapping_profiles must have source_label, confirmed, use_count after init_db()."""
+    cols = {
+        row[1]
+        for row in conn.execute(
+            "PRAGMA table_info(csv_mapping_profiles)"
+        ).fetchall()
+    }
+    for col in ("source_label", "confirmed", "use_count"):
+        assert col in cols, (
+            f"Column '{col}' missing from csv_mapping_profiles; got: {cols}"
+        )
+
+
+def test_merchant_category_overrides_has_labeller_memory_columns(conn) -> None:
+    """merchant_category_overrides must have canonical_name, source, confidence,
+    override_count after init_db()."""
+    cols = {
+        row[1]
+        for row in conn.execute(
+            "PRAGMA table_info(merchant_category_overrides)"
+        ).fetchall()
+    }
+    for col in ("canonical_name", "source", "confidence", "override_count"):
+        assert col in cols, (
+            f"Column '{col}' missing from merchant_category_overrides; got: {cols}"
+        )
+
+
+def test_migrate_schema_idempotent(tmp_path: Path) -> None:
+    """Running migrate_schema() twice on the same DB must not raise."""
+    from db.db_schema import migrate_schema
+
+    dbp = tmp_path / "idem.db"
+    c = init_db(str(dbp))
+    # Second call must be safe (no duplicate ALTER TABLE errors)
+    migrate_schema(c)
+    c.commit()
+
+
+def test_migrate_schema_on_old_db_missing_new_columns(tmp_path: Path) -> None:
+    """migrate_schema() must add new columns to a DB that was created without them."""
+    import sqlite3 as _sqlite3
+    from db.db_schema import migrate_schema
+
+    dbp = tmp_path / "old.db"
+    c = _sqlite3.connect(str(dbp))
+    # Minimal old schema — only the tables, without the new columns
+    c.executescript(
+        """
+        CREATE TABLE users (id TEXT PRIMARY KEY, display_name TEXT, created_at TEXT);
+        CREATE TABLE accounts (
+            id TEXT PRIMARY KEY, user_id TEXT, name TEXT,
+            balance REAL, currency TEXT
+        );
+        CREATE TABLE transactions (
+            id TEXT PRIMARY KEY, account_id TEXT, amount REAL,
+            currency TEXT DEFAULT 'CHF', merchant TEXT,
+            category TEXT, ts TEXT
+        );
+        CREATE TABLE csv_mapping_profiles (
+            id TEXT PRIMARY KEY, user_id TEXT, display_name TEXT,
+            column_map TEXT, sign_rule TEXT, encoding TEXT,
+            delimiter TEXT, header_hash TEXT, is_default INTEGER,
+            created_at TEXT, updated_at TEXT
+        );
+        CREATE TABLE merchant_category_overrides (
+            id TEXT PRIMARY KEY, user_id TEXT, merchant_normalized TEXT,
+            bucket TEXT, line_category TEXT, updated_at TEXT,
+            UNIQUE(user_id, merchant_normalized)
+        );
+        CREATE TABLE goals (id TEXT PRIMARY KEY, user_id TEXT, goal_type TEXT,
+            engagement TEXT, active INTEGER, created_at TEXT);
+        CREATE TABLE budgets (id TEXT PRIMARY KEY, user_id TEXT,
+            allocations TEXT, target_ratios TEXT, period TEXT, created_at TEXT);
+        CREATE TABLE prefs (user_id TEXT PRIMARY KEY);
+        CREATE TABLE import_batches (id TEXT PRIMARY KEY, user_id TEXT,
+            source_path TEXT, content_sha256 TEXT, imported_at TEXT,
+            row_count INTEGER DEFAULT 0, skipped_duplicate_count INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'completed');
+        CREATE TABLE conversations (id TEXT PRIMARY KEY, user_id TEXT, started_at TEXT);
+        CREATE TABLE messages (id TEXT PRIMARY KEY, conversation_id TEXT,
+            role TEXT, content TEXT, ts TEXT);
+        CREATE TABLE conversation_summary (user_id TEXT PRIMARY KEY,
+            summary TEXT, updated_at TEXT);
+        CREATE TABLE learned_preferences (id TEXT PRIMARY KEY, user_id TEXT,
+            kind TEXT, subject TEXT, value TEXT,
+            suppressible INTEGER DEFAULT 1, evidence_count INTEGER DEFAULT 1,
+            updated_at TEXT);
+        CREATE TABLE split_snapshots (id TEXT PRIMARY KEY, user_id TEXT,
+            period TEXT, needs_pct REAL, wants_pct REAL, savings_pct REAL,
+            taken_at TEXT);
+        CREATE TABLE pending_notifications (id TEXT PRIMARY KEY, user_id TEXT,
+            tier TEXT, summary TEXT, offered_actions TEXT,
+            status TEXT DEFAULT 'awaiting', created_at TEXT);
+        CREATE TABLE category_proposals (id TEXT PRIMARY KEY, user_id TEXT,
+            txn_id TEXT, proposed_bucket TEXT, proposed_line TEXT,
+            rationale TEXT, status TEXT DEFAULT 'pending', created_at TEXT);
+        """
+    )
+    c.commit()
+
+    migrate_schema(c)
+    c.commit()
+
+    # All new columns must now exist
+    txn_cols = {row[1] for row in c.execute("PRAGMA table_info(transactions)")}
+    assert "clean_name" in txn_cols
+
+    prof_cols = {
+        row[1] for row in c.execute("PRAGMA table_info(csv_mapping_profiles)")
+    }
+    for col in ("source_label", "confirmed", "use_count"):
+        assert col in prof_cols, f"Missing '{col}' after migration"
+
+    mco_cols = {
+        row[1]
+        for row in c.execute("PRAGMA table_info(merchant_category_overrides)")
+    }
+    for col in ("canonical_name", "source", "confidence", "override_count"):
+        assert col in mco_cols, f"Missing '{col}' after migration"
+
+
 # ── Tests for mixed Debit/Credit detection (booked + pending rows) ─────────────
 
 
