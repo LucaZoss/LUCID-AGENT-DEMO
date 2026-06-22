@@ -26,9 +26,7 @@ class StartupStage(Enum):
     MODEL = "model"
     DATA_SOURCE = "data_source"
     PERSISTENCE = "persistence"
-    IMPORT = "import"
-    CATEGORIZE = "categorize"
-    SUMMARY = "summary"
+    DB_MANAGER = "db_manager"   # Agent 1: import + categorize + summary
     REPL = "repl"
 
 
@@ -646,6 +644,46 @@ def stage_summary(console, conn: sqlite3.Connection, user_id: str) -> None:
     console.rule()
 
 
+# ── Stage 4: CSV folder prompt + Agent 1 ─────────────────────────────────────
+
+def _ask_csv_folder(console) -> str:
+    """Prompt the user for the folder that contains their CSV exports."""
+    console.print(
+        "\n[bold]Enter the folder path containing your CSV files:[/bold]\n"
+        "[dim]All .csv files inside will be discovered and imported by the agent.[/dim]\n"
+    )
+    while True:
+        try:
+            raw = console.input("  folder › ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return ""
+        if not raw:
+            console.print("  [red]Folder path required.[/red]")
+            continue
+        from pathlib import Path
+        p = Path(raw).expanduser().resolve()
+        if not p.is_dir():
+            console.print(f"  [red]Not a directory: {p}[/red]  Try again.")
+            continue
+        return str(p)
+
+
+def stage_db_manager(
+    console,
+    llm,
+    conn: sqlite3.Connection,
+    user_id: str,
+    account_id: str,
+) -> str:
+    """Run Agent 1 (Database Manager) — returns summary text."""
+    from agents.db_manager import run_db_manager_agent
+    csv_folder = _ask_csv_folder(console)
+    if not csv_folder:
+        console.print("[dim]No folder provided — skipping import.[/dim]")
+        return ""
+    return run_db_manager_agent(llm, conn, user_id, account_id, csv_folder, console)
+
+
 # ── DB seeding helpers ────────────────────────────────────────────────────────
 
 _DEMO_TRANSACTIONS: list[tuple[str, float, str | None]] = [
@@ -774,17 +812,9 @@ def run_startup(console, model_override: str | None = None) -> StartupState:
     state.bank = make_db_provider(state.conn, USER_ID)
 
     if state.data_source == "csv":
-        # Stage 4 — Import
-        state.stage = StartupStage.IMPORT
-        stage_import(console, state.llm, state.conn, USER_ID)
-
-        # Stage 5 — Categorize
-        state.stage = StartupStage.CATEGORIZE
-        stage_categorize(console, state.llm, state.conn, USER_ID)
-
-        # Stage 6 — Summary
-        state.stage = StartupStage.SUMMARY
-        stage_summary(console, state.conn, USER_ID)
+        # Stage 4 — Agent 1: Database Manager (import + categorize + summary)
+        state.stage = StartupStage.DB_MANAGER
+        stage_db_manager(console, state.llm, state.conn, USER_ID, ACCOUNT_ID)
 
     # Determine if first-run (no active goal → onboarding pending)
     row = state.conn.execute(

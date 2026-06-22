@@ -1183,15 +1183,42 @@ def main() -> None:
                 )
             )
     else:
-        # CSV path: data is already loaded and summarized — go straight to REPL
+        # CSV path: Agent 1 is done — hand off to Agent 2 (Budget Planner)
+        _CONSOLE.print()
+        _CONSOLE.print(Rule(style=f"bold {_RULE_COLOR}"))
         _CONSOLE.print(
             Panel(
-                f"[{_DIM_TEXT}]Data loaded. Type [bold {_ACCENT}]/help[/bold {_ACCENT}] "
-                f"for commands or start chatting.[/{_DIM_TEXT}]",
+                Text.assemble(
+                    ("Agent 2: Budget Planner\n\n", f"bold {_ACCENT}"),
+                    (
+                        "Your data is imported and categorized.\n"
+                        "Now let's define your financial goal and build a budget "
+                        "that fits your life.\n",
+                        "",
+                    ),
+                ),
+                title=f"[bold {_ACCENT}]budget planner[/bold {_ACCENT}]",
                 border_style=f"dim {_ACCENT_DEEP}",
-                padding=(0, 1),
+                padding=(1, 2),
             )
         )
+        # Kick the agent — goal_intake skill takes it from here
+        with _CONSOLE.status(
+            f"[{_DIM_TEXT}]thinking…[/{_DIM_TEXT}]",
+            spinner="dots",
+            spinner_style=_ACCENT,
+        ):
+            _agent2_response = handle_message(
+                llm=llm,
+                conn=conn,
+                user_id=_USER_ID,
+                conversation_id=_CONV_ID,
+                user_message=(
+                    "My bank data is imported. "
+                    "I'd like to set a financial goal and start budgeting."
+                ),
+            )
+        _render_response(_agent2_response)
 
     while True:
         try:
