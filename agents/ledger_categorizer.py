@@ -133,7 +133,7 @@ def _load_merchant_overrides(conn: sqlite3.Connection, user_id: str) -> dict[str
     return {r[0]: (r[1], r[2]) for r in rows}
 
 
-def run_ledger_categorizer(
+def run_ledger_categorizer_legacy(
     llm: LLMProvider,
     conn: sqlite3.Connection,
     user_id: str,
@@ -141,7 +141,7 @@ def run_ledger_categorizer(
     batch_limit: int = 15,
     max_iterations: int = 8,
 ) -> str:
-    """Propose categories for a batch of uncategorized outflows; returns summary text."""
+    """Original ledger categorizer (LLM-only, no HITL). Kept for reference."""
     txns = _fetch_uncategorized_outflows(conn, user_id, batch_limit)
     if not txns:
         return "No uncategorized outflow transactions to process."
@@ -213,3 +213,31 @@ def run_ledger_categorizer(
 
     suffix = f" ({pre_filled} pre-filled from merchant memory)" if pre_filled else ""
     return f"(ledger categorizer reached iteration limit){suffix}"
+
+
+def run_ledger_categorizer(
+    llm: LLMProvider,
+    conn: sqlite3.Connection,
+    user_id: str,
+    *,
+    batch_limit: int = 15,
+    max_iterations: int = 8,
+    console=None,
+) -> str:
+    """Entry point for /cat-run REPL command.
+
+    When *console* is provided, delegates to the new Labeller Agent (HITL).
+    Otherwise falls back to the legacy LLM-only categorizer for headless use.
+    """
+    if console is not None:
+        from agents.labeller.agent import run_labeller_agent
+        return run_labeller_agent(
+            llm, conn, user_id, console,
+            batch_limit=batch_limit,
+            max_iterations=max_iterations,
+        )
+    return run_ledger_categorizer_legacy(
+        llm, conn, user_id,
+        batch_limit=batch_limit,
+        max_iterations=max_iterations,
+    )

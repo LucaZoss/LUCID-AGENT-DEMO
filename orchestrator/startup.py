@@ -26,8 +26,12 @@ class StartupStage(Enum):
     MODEL = "model"
     DATA_SOURCE = "data_source"
     PERSISTENCE = "persistence"
-    DB_MANAGER = "db_manager"   # Agent 1: import + categorize + summary
+    ETL_LOADER = "etl_loader"   # Agent 1: CSV discovery, column mapping, import
+    LABELLER = "labeller"       # Agent 2: clean names, classify buckets
     REPL = "repl"
+
+    # Backward-compat alias so any external code referencing DB_MANAGER still works
+    DB_MANAGER = "etl_loader"
 
 
 @dataclass
@@ -668,6 +672,33 @@ def _ask_csv_folder(console) -> str:
         return str(p)
 
 
+def stage_etl_loader(
+    console,
+    llm,
+    conn: sqlite3.Connection,
+    user_id: str,
+    account_id: str,
+) -> str:
+    """Run ETL Loader Agent (CSV discovery, column mapping, import)."""
+    from agents.etl_loader.agent import run_etl_loader_agent
+    csv_folder = _ask_csv_folder(console)
+    if not csv_folder:
+        console.print("[dim]No folder provided — skipping import.[/dim]")
+        return ""
+    return run_etl_loader_agent(llm, conn, user_id, account_id, csv_folder, console)
+
+
+def stage_labeller(
+    console,
+    llm,
+    conn: sqlite3.Connection,
+    user_id: str,
+) -> str:
+    """Run Labeller Agent (clean names, classify buckets)."""
+    from agents.labeller.agent import run_labeller_agent
+    return run_labeller_agent(llm, conn, user_id, console)
+
+
 def stage_db_manager(
     console,
     llm,
@@ -675,13 +706,8 @@ def stage_db_manager(
     user_id: str,
     account_id: str,
 ) -> str:
-    """Run Agent 1 (Database Manager) — returns summary text."""
-    from agents.db_manager import run_db_manager_agent
-    csv_folder = _ask_csv_folder(console)
-    if not csv_folder:
-        console.print("[dim]No folder provided — skipping import.[/dim]")
-        return ""
-    return run_db_manager_agent(llm, conn, user_id, account_id, csv_folder, console)
+    """Backward-compat alias for stage_etl_loader."""
+    return stage_etl_loader(console, llm, conn, user_id, account_id)
 
 
 # ── DB seeding helpers ────────────────────────────────────────────────────────
@@ -812,9 +838,14 @@ def run_startup(console, model_override: str | None = None) -> StartupState:
     state.bank = make_db_provider(state.conn, USER_ID)
 
     if state.data_source == "csv":
-        # Stage 4 — Agent 1: Database Manager (import + categorize + summary)
-        state.stage = StartupStage.DB_MANAGER
-        stage_db_manager(console, state.llm, state.conn, USER_ID, ACCOUNT_ID)
+        # Stage 4 — ETL Loader: CSV discovery, column mapping, import
+        state.stage = StartupStage.ETL_LOADER
+        stage_etl_loader(console, state.llm, state.conn, USER_ID, ACCOUNT_ID)
+
+        # Stage 5 — Labeller: clean names, classify buckets
+        state.stage = StartupStage.LABELLER
+        stage_labeller(console, state.llm, state.conn, USER_ID)
+        stage_summary(console, state.conn, USER_ID)
 
     # Determine if first-run (no active goal → onboarding pending)
     row = state.conn.execute(

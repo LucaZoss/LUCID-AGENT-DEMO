@@ -279,62 +279,9 @@ def run_db_manager_agent(
     *,
     max_iterations: int = 40,
 ) -> str:
-    """
-    Run the Database Manager Agent interactively.
-
-    The agent discovers CSVs, confirms schema with the user, imports,
-    categorizes, and shows a summary. Returns the final text response.
-    """
-    console.print("\n[bold cyan]━━  Agent 1: Database Manager  ━━[/bold cyan]")
-    console.print(
-        "[dim]I'll help you import and categorize your bank data. "
-        "I'll ask before I write anything.[/dim]\n"
+    """Delegated to agents.etl_loader.agent for backward compatibility."""
+    from agents.etl_loader.agent import run_etl_loader_agent
+    return run_etl_loader_agent(
+        llm, conn, user_id, account_id, csv_folder, console,
+        max_iterations=max_iterations,
     )
-
-    messages: list[dict[str, Any]] = [
-        {
-            "role": "user",
-            "content": (
-                f"Please help me import my bank CSV files.\n"
-                f"Folder: {csv_folder}\n"
-                f"Scan it, confirm the column mapping for each file, "
-                f"import the data, categorize transactions, and show me a summary."
-            ),
-        }
-    ]
-
-    final_text = "Import complete."
-
-    for _ in range(max_iterations):
-        resp = llm.complete(
-            system=_SYSTEM,
-            messages=messages,
-            tools=_TOOLS,
-        )
-
-        if resp.content:
-            console.print(
-                f"\n[bold cyan]  Database Manager Agent:[/bold cyan]\n  {resp.content}"
-            )
-            final_text = resp.content
-
-        if resp.stop_reason == "end_turn" or not resp.tool_calls:
-            break
-
-        messages.append({
-            "role": "assistant",
-            "content": resp.content,
-            "tool_calls": [_tc_to_openai_dict(tc) for tc in resp.tool_calls],
-        })
-
-        for tc in resp.tool_calls:
-            result = _dispatch_tool(
-                tc.name, tc.arguments, conn, user_id, account_id, console
-            )
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": json.dumps(result, default=str),
-            })
-
-    return final_text
