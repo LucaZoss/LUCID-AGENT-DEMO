@@ -121,7 +121,7 @@ def _live_snapshot(conn, user_id: str, tools) -> dict:
             target_date=date.fromisoformat(goal_row[4]) if goal_row[4] else None,
             engagement=goal_row[5], framework=goal_row[6], active=bool(goal_row[7]),
         )
-        income = split.income_chf
+        income = split.income_chf if split and split.mode == "income_based" else 0.0
         current_savings = _fetch_savings(conn, user_id)
         try:
             feasibility = tools.compute_goal_feasibility(goal, income or 1.0, current_savings)

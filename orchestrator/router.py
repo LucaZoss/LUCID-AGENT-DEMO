@@ -136,8 +136,8 @@ def _dispatch_tool(
         try:
             result = tools_module.compute_split(txns)
             return asdict(result)
-        except ValueError as exc:
-            return {"error": str(exc)}
+        except ValueError:
+            return {"error": f"No transactions found in the last {days} days."}
 
     if name == "get_goal_status":
         row = conn.execute(

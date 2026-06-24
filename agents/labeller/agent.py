@@ -1,13 +1,19 @@
 """
-Labeller Agent — Agent 2 in the refactored LUCID pipeline.
+Labeller Agent — Agent 2 in the LUCID pipeline.
+
+Responsibility: assign a descriptive *line_category* (e.g. "Grocery Stores",
+"Electronics Stores") and a clean display name to every uncategorized outflow
+transaction.
+
+It does NOT assign need/want/savings — that is the budget agent's job.
 
 Steps:
-  1. fetch_unlabelled → batch of uncategorized outflow transactions
-  2. For each: lookup_merchant_memory → check if we know this merchant
-  3. propose_clean_name + propose_bucket for all transactions
-  4. Tier by confidence: auto-apply (known, user_confirmed, high confidence) vs. needs review
-  5. batch_confirm_with_user → HITL confirmation table
-  6. apply_labels → UPDATE transactions + UPSERT merchant_category_overrides
+  1. fetch_unlabelled → batch of outflows missing line_category
+  2. detect_merchant_patterns → group by merchant prefix (2+ = rule candidate)
+  3. For each group/transaction: lookup_merchant_memory, then propose_line_category
+  4. batch_confirm_with_user → HITL table; pattern groups offer rule-saving
+  5. apply_labels → UPDATE transactions (clean_name, line_category); optionally
+     UPSERT merchant_category_overrides for saved rules
 
 Usage:
     from agents.labeller.agent import run_labeller_agent
@@ -26,22 +32,30 @@ from agents.labeller import tools as _tools
 
 _SYSTEM = """\
 You are the Labeller Agent for LUCID personal finance.
-Your job: clean merchant names and classify transactions into need/want/savings buckets.
+Your job: assign a human-readable *line_category* (e.g. "Grocery Stores",
+"Electronics Stores", "Streaming Services") and a clean merchant name to every
+uncategorized outflow transaction imported from CSV.
 
-Follow these steps:
+CRITICAL RULES:
+- Do NOT narrate what you are about to do. Do NOT write step-by-step plans.
+- Do NOT generate example merchants, example outputs, or fictional data.
+- Do NOT produce any text output between tool calls.
+- Call tools immediately and silently, one after another.
+- Your ONLY text output is the final one-line summary after apply_labels completes
+  (e.g. "Labelled 50 transactions, 3 rules saved.").
+- Do NOT classify into need / want / savings. That is the budget agent's job.
+- Propose descriptive merchant-type labels only ("Restaurants", "Pharmacies", …).
+- Never invent financial amounts or do arithmetic.
+- Use your world knowledge when propose_line_category returns confidence=0.
+- For truly ambiguous merchants, default to a broad label like "Shopping".
 
-1. Call fetch_unlabelled to get uncategorized outflow transactions.
-2. For each transaction: call lookup_merchant_memory to check the merchant override table.
-3. For transactions not in memory: call propose_clean_name and propose_bucket.
-4. Call batch_confirm_with_user with all transactions (auto-apply high-confidence known merchants, show table for new ones).
-5. Call apply_labels with the confirmed results.
-6. Report a brief summary to the user.
-
-Rules:
-- Keep messages short; this is a terminal UI.
-- Never guess buckets — use the tools.
-- Income transactions (positive amount) are already excluded by fetch_unlabelled.
-- Do not discuss budgets or goals — that is the REPL's job.
+Tool call sequence (no text between steps):
+1. fetch_unlabelled
+2. detect_merchant_patterns
+3. For each group/single: lookup_merchant_memory, then propose_line_category, propose_clean_name
+4. batch_confirm_with_user (pass ALL real transaction IDs from step 1 — never invent IDs)
+5. apply_labels
+6. Output one-line summary only.
 """
 
 _TOOLS: list[dict[str, Any]] = [
@@ -49,7 +63,7 @@ _TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "fetch_unlabelled",
-            "description": "Return outflow transactions without clean_name or category.",
+            "description": "Return outflow transactions without a line_category.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -64,8 +78,30 @@ _TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "detect_merchant_patterns",
+            "description": (
+                "Group transactions by normalized merchant name. "
+                "Returns patterns (2+ rows sharing a merchant prefix) — candidates "
+                "for a saved rule — and singles."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "transactions": {
+                        "type": "array",
+                        "description": "List of transaction dicts from fetch_unlabelled.",
+                        "items": {"type": "object"},
+                    }
+                },
+                "required": ["transactions"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "lookup_merchant_memory",
-            "description": "Check if a merchant is in the override table with a known clean name and bucket.",
+            "description": "Check the override table for a known line_category for this merchant.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -79,7 +115,7 @@ _TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "propose_clean_name",
-            "description": "Return the deterministic cleaned merchant name.",
+            "description": "Return the deterministic cleaned merchant display name.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -92,19 +128,22 @@ _TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "propose_bucket",
-            "description": "Return the proposed need/want/savings bucket and confidence.",
+            "name": "propose_line_category",
+            "description": (
+                "Return a proposed descriptive line_category for a merchant. "
+                "Uses sector_hint from CSV if available, then merchant rules. "
+                "Returns line_category=null when unknown — use your own judgment then."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "merchant": {"type": "string"},
-                    "amount": {"type": "number"},
                     "sector_hint": {
                         "type": "string",
-                        "description": "Raw bank category label from CSV (optional).",
+                        "description": "Raw bank category label from CSV, if present.",
                     },
                 },
-                "required": ["merchant", "amount"],
+                "required": ["merchant"],
             },
         },
     },
@@ -113,8 +152,9 @@ _TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "batch_confirm_with_user",
             "description": (
-                "Show tiered confirmation UI: auto-apply known confirmed merchants, "
-                "display review table for new/low-confidence ones. Returns confirmed labels."
+                "Show HITL confirmation UI. Pattern groups are presented once with "
+                "an option to save as a rule. Auto-apply known merchants in bulk. "
+                "Returns confirmed label list."
             ),
             "parameters": {
                 "type": "object",
@@ -122,9 +162,10 @@ _TOOLS: list[dict[str, Any]] = [
                     "transactions": {
                         "type": "array",
                         "description": (
-                            "List of transaction dicts, each with: txn_id, merchant, "
-                            "amount, clean_name, proposed_bucket, confidence, "
-                            "auto_apply (bool), sector_hint (optional)."
+                            "All transactions to confirm. Each dict: txn_id, merchant, "
+                            "amount, clean_name, proposed_line_category, confidence, "
+                            "auto_apply (bool), sector_hint (optional), "
+                            "pattern_key (optional), is_pattern_lead (optional bool)."
                         ),
                         "items": {"type": "object"},
                     }
@@ -137,13 +178,20 @@ _TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "apply_labels",
-            "description": "Write confirmed clean_name + category to transactions; update merchant memory.",
+            "description": (
+                "Write clean_name + line_category to transactions. "
+                "When save_rule=True in a confirmed entry, also upsert "
+                "merchant_category_overrides for future auto-labelling."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "confirmed": {
                         "type": "array",
-                        "description": "List from batch_confirm_with_user: [{txn_id, clean_name, bucket, source}]",
+                        "description": (
+                            "List from batch_confirm_with_user: "
+                            "[{txn_id, clean_name, line_category, source, save_rule}]"
+                        ),
                         "items": {"type": "object"},
                     }
                 },
@@ -168,15 +216,17 @@ def _dispatch_tool(
     conn: sqlite3.Connection,
     user_id: str,
     console,
-    # merchant_raw_map shared across the agent run so apply_labels can look up raw names
     merchant_raw_map: dict[str, str],
 ) -> Any:
     if name == "fetch_unlabelled":
         result = _tools.fetch_unlabelled(conn, user_id, int(args.get("limit", 50)))
-        # Build raw merchant map for later apply_labels call
         for t in result.get("transactions", []):
             merchant_raw_map[t["txn_id"]] = t["merchant"]
         return result
+
+    if name == "detect_merchant_patterns":
+        txns = list(args.get("transactions") or [])
+        return _tools.detect_merchant_patterns(txns)
 
     if name == "lookup_merchant_memory":
         return _tools.lookup_merchant_memory(conn, user_id, str(args.get("merchant", "")))
@@ -184,10 +234,9 @@ def _dispatch_tool(
     if name == "propose_clean_name":
         return _tools.propose_clean_name(str(args.get("merchant", "")))
 
-    if name == "propose_bucket":
-        return _tools.propose_bucket(
+    if name == "propose_line_category":
+        return _tools.propose_line_category(
             str(args.get("merchant", "")),
-            float(args.get("amount", 0.0)),
             sector_hint=args.get("sector_hint") or None,
         )
 
@@ -209,13 +258,13 @@ def run_labeller_agent(
     console,
     *,
     batch_limit: int = 50,
-    max_iterations: int = 30,
+    max_iterations: int = 40,
 ) -> str:
     """Run the Labeller Agent interactively. Returns final summary text."""
-    console.print("\n[bold cyan]━━  Labeller: cleaning names & classifying  ━━[/bold cyan]")
+    console.print("\n[bold cyan]━━  Labeller: categorising transactions  ━━[/bold cyan]")
     console.print(
-        "[dim]I'll clean merchant names and classify transactions. "
-        "Known merchants are auto-applied; new ones need a quick review.[/dim]\n"
+        "[dim]I'll assign a descriptive category to each transaction. "
+        "Repeated merchants can be saved as rules for future imports.[/dim]\n"
     )
 
     merchant_raw_map: dict[str, str] = {}
@@ -224,9 +273,11 @@ def run_labeller_agent(
         {
             "role": "user",
             "content": (
-                f"Please label up to {batch_limit} uncategorized transactions. "
-                "Fetch unlabelled transactions, check merchant memory, propose clean names "
-                "and buckets, confirm with me, then apply the labels."
+                f"Please categorise up to {batch_limit} uncategorised transactions. "
+                "Fetch them, detect merchant patterns, look up merchant memory, "
+                "propose a descriptive line_category and clean name for each, "
+                "confirm with me (offering to save rules for repeated merchants), "
+                "then apply the labels."
             ),
         }
     ]
@@ -245,13 +296,12 @@ def run_labeller_agent(
             console.print("[dim]  Check your API key / provider and retry with /cat-run.[/dim]")
             return f"Labelling aborted: {exc}"
 
-        if resp.content:
-            console.print(
-                f"\n[bold cyan]  Labeller:[/bold cyan]\n  {resp.content}"
-            )
+        is_final = resp.stop_reason == "end_turn" or not resp.tool_calls
+        if resp.content and is_final:
+            console.print(f"\n[bold cyan]  Labeller:[/bold cyan]\n  {resp.content}")
             final_text = resp.content
 
-        if resp.stop_reason == "end_turn" or not resp.tool_calls:
+        if is_final:
             break
 
         messages.append({

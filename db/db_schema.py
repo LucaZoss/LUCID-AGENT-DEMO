@@ -266,6 +266,10 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
                 "ALTER TABLE csv_mapping_profiles "
                 "ADD COLUMN use_count INTEGER DEFAULT 0"
             )
+        if "skip_patterns" not in prof_cols:
+            conn.execute(
+                "ALTER TABLE csv_mapping_profiles ADD COLUMN skip_patterns TEXT"
+            )
 
     # merchant_category_overrides: Sub-plan 1 Labeller agent memory fields
     if "merchant_category_overrides" in tables:

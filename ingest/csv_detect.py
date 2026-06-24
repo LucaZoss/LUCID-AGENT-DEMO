@@ -162,6 +162,7 @@ class ResolvedColumnMapping:
     encoding: str
     delimiter: str
     category_col: str | None = None  # raw bank category label → stored as line_category
+    skip_patterns: tuple[str, ...] = ()  # row-level skip filters (any-column substring match)
 
 
 def header_row_hash(headers: list[str], delimiter: str) -> str:

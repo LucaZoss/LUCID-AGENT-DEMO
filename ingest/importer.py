@@ -54,7 +54,27 @@ class ImportResult:
     rows_inserted: int = 0
     rows_skipped_duplicate: int = 0
     rows_skipped_invalid: int = 0
+    rows_skipped_transfer: int = 0
     warnings: list[str] = field(default_factory=list)
+    duplicate_rows: list[dict] = field(default_factory=list)
+    account_id: str | None = None
+
+
+def _row_matches_skip(row: dict, patterns: tuple[str, ...]) -> bool:
+    """Return True if any skip pattern matches a column value in the row.
+
+    Plain pattern: checked case-insensitively against ALL column values.
+    'ColumnName:text' pattern: checked only against the named column.
+    """
+    for pat in patterns:
+        if ":" in pat:
+            col, sub = pat.split(":", 1)
+            if sub.lower() in str(row.get(col, "")).lower():
+                return True
+        else:
+            if any(pat.lower() in str(v).lower() for v in row.values()):
+                return True
+    return False
 
 
 def _read_file_bytes(path: Path) -> bytes:
@@ -66,8 +86,9 @@ def _rows_from_csv(
 ) -> tuple[list[str], list[dict[str, str]]]:
     """Parse CSV bytes into (headers, rows) using pandas.
 
-    *header_row_idx* tells pandas which line is the header, letting it skip
-    any number of bank-specific metadata rows automatically.
+    Uses skiprows + header=0 instead of header=N so that blank metadata lines
+    are counted by absolute position (pandas skip_blank_lines=True would
+    otherwise mis-index the header when empty lines precede it).
     """
     text = raw.decode(encoding, errors="replace")
     if not text.strip():
@@ -78,7 +99,8 @@ def _rows_from_csv(
         dtype=str,
         keep_default_na=False,
         on_bad_lines="skip",
-        header=header_row_idx,
+        skiprows=header_row_idx,
+        header=0,
     )
     df.columns = [str(c).strip() for c in df.columns]
     df = df.fillna("")
@@ -159,6 +181,7 @@ def import_csv_files(
                     encoding=p["encoding"] or enc,
                     delimiter=p["delimiter"] or delim,
                     category_col=p.get("category_col"),
+                    skip_patterns=tuple(p.get("skip_patterns") or []),
                 )
                 used_profile = profile_id
 
@@ -172,6 +195,7 @@ def import_csv_files(
                     encoding=p2["encoding"] or enc,
                     delimiter=p2["delimiter"] or delim,
                     category_col=p2.get("category_col"),
+                    skip_patterns=tuple(p2.get("skip_patterns") or []),
                 )
                 used_profile = p2["id"]
 
@@ -216,13 +240,19 @@ def import_csv_files(
         skipped_dup = 0
         skipped_bad = 0
         skipped_pending = 0
+        skipped_transfer = 0
         warns: list[str] = []
         income_seen = False
+        dup_rows: list[dict] = []
 
         for i, row in enumerate(data_rows):
             if i >= max_rows:
                 warns.append(f"stopped after {max_rows} rows (row cap)")
                 break
+
+            if resolved.skip_patterns and _row_matches_skip(row, resolved.skip_patterns):
+                skipped_transfer += 1
+                continue
 
             date_raw = row.get(resolved.column_map.get("date", ""), "")
             ts = parse_date_to_utc(date_raw)
@@ -271,6 +301,17 @@ def import_csv_files(
             ).fetchone()
             if exists:
                 skipped_dup += 1
+                dup_rows.append({
+                    "date": ts.date().isoformat(),
+                    "merchant": merchant,
+                    "amount": round(amt, 2),
+                    "category": csv_line_category or "",
+                    "fingerprint": fp,
+                    "account_id": account_id,
+                    "currency": "CHF",
+                    "line_category": csv_line_category,
+                    "ts": ts.isoformat(),
+                })
                 continue
 
             tid = f"csv-{uuid.uuid4().hex[:12]}"
@@ -307,6 +348,11 @@ def import_csv_files(
         )
         conn.commit()
 
+        if skipped_transfer:
+            warns.append(
+                f"{skipped_transfer} row(s) skipped — matched row-skip pattern."
+            )
+
         if skipped_pending:
             warns.append(
                 f"{skipped_pending} pending transaction(s) skipped "
@@ -316,8 +362,8 @@ def import_csv_files(
 
         if not income_seen and inserted:
             warns.append(
-                "No positive (income) rows in this file — compute_split may fail "
-                "until salary/deposits are present."
+                "No positive (income) rows in this file — /split will show "
+                "spending composition only until salary/deposits are imported."
             )
 
         results.append(
@@ -329,7 +375,10 @@ def import_csv_files(
                 rows_inserted=inserted,
                 rows_skipped_duplicate=skipped_dup,
                 rows_skipped_invalid=skipped_bad,
+                rows_skipped_transfer=skipped_transfer,
                 warnings=warns,
+                duplicate_rows=dup_rows,
+                account_id=account_id,
             )
         )
     return results

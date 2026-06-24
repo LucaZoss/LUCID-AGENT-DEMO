@@ -105,24 +105,22 @@ def detect_all() -> list[tuple[str, LiteLLMAdapter]]:
 
     # 4. Google
     if os.getenv("GOOGLE_API_KEY"):
-        results.append(("Google · gemini-2.5-flash", LiteLLMAdapter(model="gemini/gemini-2.5-flash")))
+        results.append(("Google · gemini-2.5-flash-lite", LiteLLMAdapter(model="gemini/gemini-2.5-flash-lite")))
 
-    # 5. Ollama (OpenAI-compat endpoint)
+    # 5. Ollama (OpenAI-compat endpoint) — one entry per installed model
     ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434/v1")
     mn = _probe_openai_compat(ollama_url)
     if mn:
         data = _http_get_json(f"{ollama_url}/models") or {}
         models = data.get("models") or data.get("data") or []
-        names = [m.get("id") or m.get("name", "") for m in models]
-        preferred = next(
-            (n for n in names if any(t in n for t in
-             ("instruct", "chat", "qwen", "llama", "phi", "mistral"))),
-            mn,
-        )
-        results.append((
-            f"Ollama · {preferred}",
-            LiteLLMAdapter(model=f"openai/{preferred}", api_base=ollama_url, api_key="ollama"),
-        ))
+        names = [m.get("id") or m.get("name", "") for m in models if m.get("id") or m.get("name")]
+        if not names:
+            names = [mn]
+        for name in names:
+            results.append((
+                f"Ollama · {name}",
+                LiteLLMAdapter(model=f"openai/{name}", api_base=ollama_url, api_key="ollama"),
+            ))
 
     return results
 
@@ -222,7 +220,7 @@ def _interactive_setup() -> LiteLLMAdapter:
     if choice == 3:
         key = _ask("GOOGLE_API_KEY")
         os.environ["GOOGLE_API_KEY"] = key
-        return LiteLLMAdapter(model="gemini/gemini-2.5-flash")
+        return LiteLLMAdapter(model="gemini/gemini-2.5-flash-lite")
 
     if choice == 4:
         url = _ask("llama.cpp base URL [http://localhost:8080/v1]") or "http://localhost:8080/v1"
@@ -345,7 +343,7 @@ def reconfigure_adapter(console=None) -> LiteLLMAdapter:
         key = _ask_key("GOOGLE_API_KEY")
         os.environ["GOOGLE_API_KEY"] = key
         _offer_save("GOOGLE_API_KEY", key)
-        return LiteLLMAdapter(model="gemini/gemini-2.5-flash")
+        return LiteLLMAdapter(model="gemini/gemini-2.5-flash-lite")
 
     if choice == 4:
         url = _ask("llama.cpp base URL") or "http://localhost:8080/v1"

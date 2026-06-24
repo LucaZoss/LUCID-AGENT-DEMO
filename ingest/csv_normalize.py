@@ -91,10 +91,10 @@ def signed_amount_from_row(
     if sign_rule == "debit_credit":
         dk = column_map.get("debit")
         ck = column_map.get("credit")
-        if not dk or not ck:
+        if not dk:
             return None
         debit = parse_decimal(row.get(dk, "")) or 0.0
-        credit = parse_decimal(row.get(ck, "")) or 0.0
+        credit = (parse_decimal(row.get(ck, "")) if ck else None) or 0.0
         if debit and credit:
             # ambiguous row — prefer debit as spend if both set
             if debit >= credit:

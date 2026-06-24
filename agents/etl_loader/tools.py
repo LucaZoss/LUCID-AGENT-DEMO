@@ -66,7 +66,7 @@ def lookup_format_profile(
 
     row = conn.execute(
         "SELECT id, display_name, column_map, sign_rule, encoding, delimiter, "
-        "confirmed, use_count, source_label, category_col "
+        "confirmed, use_count, source_label, category_col, skip_patterns "
         "FROM csv_mapping_profiles "
         "WHERE user_id=? AND header_hash=? "
         "ORDER BY use_count DESC, updated_at DESC LIMIT 1",
@@ -102,6 +102,7 @@ def lookup_format_profile(
         "category_col": row[9],
         "header_fingerprint": fp,
         "auto_apply": bool(row[6]) and (row[7] or 0) >= 2,
+        "skip_patterns": json.loads(row[10] or "[]") if len(row) > 10 else [],
     }
 
 
@@ -154,6 +155,7 @@ def import_file(
     encoding: str = "utf-8",
     delimiter: str = ",",
     category_col: str | None = None,
+    skip_patterns: list[str] | None = None,
 ) -> dict[str, Any]:
     """Import a CSV using the provided mapping; return ImportResult stats."""
     from ingest.csv_detect import ResolvedColumnMapping
@@ -165,6 +167,7 @@ def import_file(
         encoding=encoding,
         delimiter=delimiter,
         category_col=category_col,
+        skip_patterns=tuple(skip_patterns or []),
     )
     results = import_csv_files(conn, user_id, account_id, [p], mapping=mapping)
     if not results:
@@ -178,7 +181,10 @@ def import_file(
         "rows_inserted": r.rows_inserted,
         "rows_skipped_duplicate": r.rows_skipped_duplicate,
         "rows_skipped_invalid": r.rows_skipped_invalid,
+        "rows_skipped_transfer": r.rows_skipped_transfer,
         "warnings": r.warnings,
+        "duplicate_rows": r.duplicate_rows,
+        "account_id": r.account_id,
     }
 
 
@@ -192,6 +198,7 @@ def save_format_profile(
     delimiter: str = ",",
     source_label: str | None = None,
     category_col: str | None = None,
+    skip_patterns: list[str] | None = None,
 ) -> dict[str, Any]:
     """Persist a confirmed format profile; increment use_count if header already known."""
     from ingest.importer import preview_csv_file
@@ -209,6 +216,7 @@ def save_format_profile(
 
     hh = header_row_hash(headers, delimiter) if headers else ""
     now = datetime.now(timezone.utc).isoformat()
+    sp_json = json.dumps(skip_patterns or [])
 
     # Check if a profile for this header hash already exists
     existing = conn.execute(
@@ -223,7 +231,7 @@ def save_format_profile(
         conn.execute(
             "UPDATE csv_mapping_profiles SET column_map=?, sign_rule=?, "
             "encoding=?, delimiter=?, confirmed=1, use_count=?, source_label=?, "
-            "category_col=?, updated_at=? WHERE id=?",
+            "category_col=?, skip_patterns=?, updated_at=? WHERE id=?",
             (
                 json.dumps(column_map),
                 sign_rule,
@@ -232,6 +240,7 @@ def save_format_profile(
                 new_count,
                 source_label,
                 category_col,
+                sp_json,
                 now,
                 pid,
             ),
@@ -242,8 +251,8 @@ def save_format_profile(
             "INSERT INTO csv_mapping_profiles("
             "id, user_id, display_name, column_map, sign_rule, encoding, delimiter, "
             "header_hash, is_default, confirmed, use_count, source_label, "
-            "category_col, created_at, updated_at"
-            ") VALUES (?,?,?,?,?,?,?,?,0,1,1,?,?,?,?)",
+            "category_col, skip_patterns, created_at, updated_at"
+            ") VALUES (?,?,?,?,?,?,?,?,0,1,1,?,?,?,?,?)",
             (
                 pid,
                 user_id,
@@ -255,6 +264,7 @@ def save_format_profile(
                 hh,
                 source_label,
                 category_col,
+                sp_json,
                 now,
                 now,
             ),

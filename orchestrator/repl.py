@@ -140,6 +140,8 @@ def _render_help() -> None:
         ("/import preview <f>   ", "dry-run preview only — no rows written"),
         ("/import-rollback <id> ", "remove transactions from an import batch"),
         ("/import-mapping …     ", "list | save <name> | set-default <profile_id>"),
+        ("/rules                ", "LLM-assisted rule creation for uncategorized transactions"),
+        ("/rules list           ", "show all saved merchant categorization rules"),
         ("/review-categories    ", "show pending bucket/line proposals + deterministic hint"),
         ("/cat-run              ", "run ledger categorizer LLM on uncategorized outflows"),
         ("/cat-accept <id> …    ", "accept proposal; optional: bucket need line groceries"),
@@ -305,8 +307,12 @@ def _cmd_split(conn, user_id: str) -> None:
         return bar
 
     body = Text()
-    body.append("90-day income\n", style=f"dim {_DIM_TEXT}")
-    body.append(f"  CHF {s.income_chf:,.2f}\n\n", style="bold")
+    if s.mode == "spend_composition":
+        body.append("No income in window — showing % of total spending\n", style=f"dim {_DIM_TEXT}")
+        body.append(f"  Total spend CHF {s.needs_chf + s.wants_chf + s.savings_chf:,.2f}\n\n", style="bold")
+    else:
+        body.append("90-day income\n", style=f"dim {_DIM_TEXT}")
+        body.append(f"  CHF {s.income_chf:,.2f}\n\n", style="bold")
 
     for label, chf, pct, color in [
         ("Needs   ", s.needs_chf,   s.needs_pct,   _NEED_COLOR),
@@ -980,6 +986,50 @@ def _cmd_cat_reject(conn: sqlite3.Connection, parts: list[str]) -> None:
     )
 
 
+def _cmd_rules(conn: sqlite3.Connection, llm, parts: list[str]) -> None:
+    """/rules [review|list] — LLM-assisted merchant categorization rules."""
+    sub = parts[1].lower() if len(parts) > 1 else "review"
+
+    if sub == "list":
+        rows = conn.execute(
+            "SELECT merchant_normalized, canonical_name, bucket, line_category, "
+            "source, confidence, override_count "
+            "FROM merchant_category_overrides WHERE user_id=? "
+            "ORDER BY override_count DESC, updated_at DESC",
+            (_USER_ID,),
+        ).fetchall()
+        if not rows:
+            _CONSOLE.print(f"[{_DIM_TEXT}]No saved rules yet. Run /rules to create some.[/{_DIM_TEXT}]")
+            return
+        t = Table(box=None, show_lines=False, header_style=f"bold {_DIM_TEXT}")
+        t.add_column("Merchant", max_width=30, overflow="fold")
+        t.add_column("Clean name", max_width=22, overflow="fold")
+        t.add_column("Bucket", width=8)
+        t.add_column("Label", width=18)
+        t.add_column("Source", width=16)
+        t.add_column("Used", justify="right", width=5)
+        for r in rows:
+            bucket_color = {
+                "need": _NEED_COLOR, "want": _WANT_COLOR, "savings": _SAVE_COLOR,
+            }.get(r[2] or "", _DIM_TEXT)
+            t.add_row(
+                r[0], r[1] or "—",
+                f"[{bucket_color}]{r[2] or '—'}[/{bucket_color}]",
+                r[3] or "—", r[4] or "—", str(r[6] or 0),
+            )
+        _CONSOLE.print(Panel(
+            t,
+            title=f"[bold {_ACCENT}]rules ({len(rows)})[/bold {_ACCENT}]",
+            border_style=f"dim {_ACCENT_DEEP}",
+            padding=(0, 1),
+        ))
+        return
+
+    # Default: interactive review flow
+    from agents.labeller.rules_flow import run_rules_review
+    run_rules_review(llm, conn, _USER_ID, _CONSOLE)
+
+
 def _cmd_cat_run(conn: sqlite3.Connection, llm) -> None:
     with _CONSOLE.status("ledger categorizer…", spinner="dots", spinner_style=_ACCENT):
         out = run_ledger_categorizer(llm, conn, _USER_ID)
@@ -1291,6 +1341,9 @@ def main() -> None:
 
             elif cmd == "/import-mapping":
                 _cmd_import_mapping(conn, parts)
+
+            elif cmd == "/rules":
+                _cmd_rules(conn, llm, parts)
 
             elif cmd == "/review-categories":
                 _cmd_review_categories(conn)

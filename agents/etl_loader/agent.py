@@ -24,6 +24,256 @@ from llm.provider import LLMProvider, ToolCall
 
 from agents.etl_loader import tools as _tools
 
+
+# ── Deterministic pipeline (no LLM) ──────────────────────────────────────────
+
+def _print_import_summary(
+    console,
+    conn: sqlite3.Connection,
+    batch_ids: list[str],
+) -> None:
+    """Print a describe-style summary of the just-imported transactions."""
+    if not batch_ids:
+        return
+
+    placeholders = ",".join("?" * len(batch_ids))
+    rows = conn.execute(
+        f"""
+        SELECT t.ts, t.merchant, t.amount, t.line_category
+        FROM transactions t
+        WHERE t.import_batch_id IN ({placeholders})
+        ORDER BY t.ts
+        """,
+        batch_ids,
+    ).fetchall()
+
+    if not rows:
+        return
+
+    from collections import Counter
+
+    dates   = [r[0][:10] for r in rows if r[0]]
+    amounts = [r[2] for r in rows if r[2] is not None]
+    cats    = [r[3] or "(uncategorized)" for r in rows]
+    merchants = Counter(r[1] for r in rows if r[1])
+    cat_counts = Counter(cats)
+
+    console.print("\n[bold cyan]━━  Import summary  ━━[/bold cyan]\n")
+    console.print(f"  Transactions : [bold]{len(rows)}[/bold]")
+    if dates:
+        console.print(f"  Date range   : {min(dates)} → {max(dates)}")
+    if amounts:
+        outflow = sum(a for a in amounts if a < 0)
+        inflow  = sum(a for a in amounts if a > 0)
+        mean    = sum(amounts) / len(amounts)
+        console.print(f"  Amount (CHF) :")
+        console.print(f"    total outflow  [red]{outflow:>10.2f}[/red]")
+        if inflow:
+            console.print(f"    total inflow   [green]{inflow:>10.2f}[/green]")
+        console.print(f"    mean           {mean:>10.2f}")
+        console.print(f"    min            {min(amounts):>10.2f}")
+        console.print(f"    max            {max(amounts):>10.2f}")
+    if merchants:
+        console.print(f"\n  Top merchants:")
+        for name, count in merchants.most_common(5):
+            console.print(f"    {name:<32} {count}×")
+    if cat_counts:
+        console.print(f"\n  Categories:")
+        for cat, count in cat_counts.most_common():
+            console.print(f"    {cat:<32} {count}")
+    console.print()
+
+
+def _review_duplicates(
+    console,
+    conn: sqlite3.Connection,
+    dup_rows: list[dict],
+    account_id: str,
+) -> None:
+    """Show duplicate rows in a table and offer to force-insert them."""
+    from rich.table import Table
+
+    console.print(f"\n  [yellow]⚠  {len(dup_rows)} duplicate(s) skipped — already in DB:[/yellow]\n")
+
+    tbl = Table(box=None, show_header=True, padding=(0, 2))
+    tbl.add_column("#", style="bold cyan", width=3)
+    tbl.add_column("Date", width=11)
+    tbl.add_column("Merchant", min_width=24)
+    tbl.add_column("Amount", justify="right", width=10)
+    tbl.add_column("Category", style="dim")
+
+    for idx, row in enumerate(dup_rows, 1):
+        amt = row["amount"]
+        amt_str = f"[red]{amt:.2f}[/red]" if amt < 0 else f"[green]{amt:.2f}[/green]"
+        tbl.add_row(
+            str(idx),
+            row["date"],
+            row["merchant"],
+            amt_str,
+            row.get("category") or "",
+        )
+    console.print(tbl)
+
+    try:
+        raw = console.input(
+            "\n  Force-import duplicates? "
+            "[dim]Enter row numbers (e.g. 1,3) or [bold]a[/bold]=all / [bold]n[/bold]=none (default)[/dim] › "
+        ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        raw = ""
+
+    if not raw or raw == "n":
+        console.print("  [dim]Duplicates skipped.[/dim]")
+        return
+
+    to_insert = dup_rows if raw == "a" else [
+        dup_rows[int(i) - 1]
+        for i in raw.split(",")
+        if i.strip().isdigit() and 0 < int(i.strip()) <= len(dup_rows)
+    ]
+
+    if not to_insert:
+        console.print("  [dim]No valid selection — duplicates skipped.[/dim]")
+        return
+
+    import uuid as _uuid
+    forced = 0
+    for row in to_insert:
+        tid = f"csv-forced-{_uuid.uuid4().hex[:12]}"
+        conn.execute(
+            "INSERT INTO transactions("
+            "id, account_id, amount, currency, merchant, category, line_category, "
+            "ts, import_batch_id, external_fingerprint"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                tid,
+                account_id,
+                row["amount"],
+                row.get("currency", "CHF"),
+                row["merchant"],
+                None,
+                row.get("line_category"),
+                row["ts"],
+                None,
+                f"{row['fingerprint']}_forced_{tid}",
+            ),
+        )
+        forced += 1
+    conn.commit()
+    console.print(f"  [green]✓ {forced} duplicate(s) force-imported.[/green]")
+
+
+def run_etl_pipeline(
+    conn: sqlite3.Connection,
+    user_id: str,
+    account_id: str,
+    csv_folder: str,
+    console,
+) -> str:
+    """Deterministic ETL pipeline — zero LLM calls.
+
+    Sequence per file:
+      1. Check saved format profile (auto-apply if confirmed × ≥ 2)
+      2. Otherwise run HITL column mapping (4 fields: date, merchant, amount, category)
+      3. Import; save/update format profile
+    After all files: print a describe-style summary and return.
+    """
+    console.print("\n[bold cyan]━━  ETL Loader: importing CSV files  ━━[/bold cyan]\n")
+
+    scan = _tools.scan_folder(csv_folder)
+    if not scan.get("ok"):
+        msg = f"Cannot scan folder: {scan.get('error')}"
+        console.print(f"[red]{msg}[/red]")
+        return msg
+
+    files: list[str] = scan.get("files", [])
+    if not files:
+        msg = "No CSV files found in folder."
+        console.print(f"[dim]{msg}[/dim]")
+        return msg
+
+    console.print(f"  Found [bold]{len(files)}[/bold] file(s)\n")
+
+    all_batch_ids: list[str] = []
+
+    for file_path in files:
+        from pathlib import Path
+        fname = Path(file_path).name
+        console.print(f"[bold]─── {fname} ───[/bold]")
+
+        profile = _tools.lookup_format_profile(conn, user_id, file_path)
+
+        if profile.get("auto_apply"):
+            console.print(f"  [dim]Profile '{profile.get('source_label', 'saved')}' auto-applied.[/dim]")
+            column_map  = profile["column_map"]
+            sign_rule   = profile["sign_rule"]
+            encoding    = profile.get("encoding", "utf-8")
+            delimiter   = profile.get("delimiter", ",")
+            category_col = profile.get("category_col")
+        else:
+            result = _tools.show_columns_ask_user(
+                file_path, console, llm=None, conn=conn, user_id=user_id
+            )
+            if not result.get("ok") or result.get("skipped"):
+                console.print(f"  [yellow]Skipped.[/yellow]\n")
+                continue
+            column_map   = result["column_map"]
+            sign_rule    = result["sign_rule"]
+            encoding     = result.get("encoding", "utf-8")
+            delimiter    = result.get("delimiter", ",")
+            category_col = result.get("category_col")
+
+        imp = _tools.import_file(
+            conn, user_id, account_id,
+            file_path=file_path,
+            column_map=column_map,
+            sign_rule=sign_rule,
+            encoding=encoding,
+            delimiter=delimiter,
+            category_col=category_col,
+        )
+
+        if imp.get("ok"):
+            n = imp.get("rows_inserted", 0)
+            d = imp.get("rows_skipped_duplicate", 0)
+            console.print(f"  [green]✓ {n} rows imported[/green]  ({d} dupes skipped)")
+            invalid = imp.get("rows_skipped_invalid", 0)
+            transfer = imp.get("rows_skipped_transfer", 0)
+            if invalid:
+                console.print(
+                    f"  [yellow]⚠  {invalid} row(s) skipped — unparseable date or amount.[/yellow]"
+                )
+            if transfer:
+                console.print(
+                    f"  [dim]{transfer} row(s) skipped — matched a skip pattern.[/dim]"
+                )
+            if n == 0 and invalid > 0 and sign_rule == "debit_credit":
+                console.print(
+                    "  [dim]Hint: if both Debit/Credit columns showed 0 % fill, "
+                    "try re-importing using the 'Individual amount' column instead.[/dim]"
+                )
+            if imp.get("batch_id"):
+                all_batch_ids.append(imp["batch_id"])
+            _tools.save_format_profile(
+                conn, user_id,
+                file_path=file_path,
+                column_map=column_map,
+                sign_rule=sign_rule,
+                encoding=encoding,
+                delimiter=delimiter,
+                category_col=category_col,
+            )
+            dup_rows = imp.get("duplicate_rows") or []
+            if dup_rows:
+                _review_duplicates(console, conn, dup_rows, imp["account_id"])
+        else:
+            console.print(f"  [red]✗ {imp.get('message', 'import failed')}[/red]")
+
+        console.print()
+
+    _print_import_summary(console, conn, all_batch_ids)
+    return f"ETL complete — {len(all_batch_ids)} file(s) imported."
+
 _SYSTEM = """\
 You are the ETL Loader Agent for LUCID personal finance.
 Your job: discover CSV files in a folder, confirm their column mapping, import them, and save format profiles.
@@ -43,7 +293,8 @@ Rules:
 - Keep messages short; this is a terminal UI.
 - Never invent column names — only use names from the lookup or show_columns result.
 - Always call show_columns_ask_user when a profile is not found or not auto-applicable.
-- Currency is CHF; amounts are negative for outflows.
+- Currency is CHF; amounts are negative for outflows. Positive amounts are credits (refunds, salary, transfers in).
+- When a CSV has separate debit and credit columns, use sign_rule="debit_credit" and set column_map keys "debit" and "credit" (not "amount").
 - Do not discuss budgets or goals — that is the REPL's job.
 """
 

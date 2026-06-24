@@ -20,13 +20,14 @@ from tools.categorize import categorize_transaction
 
 @dataclass
 class SplitResult:
+    mode: str                     # "income_based" | "spend_composition"
     income_chf: float
     needs_chf: float
     wants_chf: float
     explicit_savings_chf: float   # money explicitly sent to savings/investments
     residual_savings_chf: float   # income − needs − wants − explicit_savings
     savings_chf: float            # explicit + residual (total saved)
-    needs_pct: float              # share of income, 0–100
+    needs_pct: float              # share of income (income_based) or total spend (spend_composition), 0–100
     wants_pct: float
     savings_pct: float
 
@@ -38,8 +39,10 @@ def compute_split(transactions: list[Transaction]) -> SplitResult:
     already-categorised transactions); falls back to categorize_transaction
     for uncategorised outflows.
 
-    Raises ValueError when there is no income in the transaction list —
-    ratios cannot be computed without a denominator.
+    When no income is present (e.g. credit-card-only import), falls back to
+    spend_composition mode: percentages are share of total spending, not income.
+
+    Raises ValueError only when there are no transactions at all.
     """
     income = 0.0
     needs = 0.0
@@ -62,9 +65,24 @@ def compute_split(transactions: list[Transaction]) -> SplitResult:
             explicit_savings += abs_amount
 
     if income == 0.0:
-        raise ValueError(
-            "No income transactions found; cannot compute split ratios. "
-            "Ensure the transaction window contains at least one salary / deposit."
+        total_spend = needs + wants + explicit_savings
+        if total_spend == 0.0:
+            raise ValueError("No transactions to split.")
+
+        def pct_spend(amount: float) -> float:
+            return round(amount / total_spend * 100, 1)
+
+        return SplitResult(
+            mode="spend_composition",
+            income_chf=0.0,
+            needs_chf=round(needs, 2),
+            wants_chf=round(wants, 2),
+            explicit_savings_chf=round(explicit_savings, 2),
+            residual_savings_chf=0.0,
+            savings_chf=round(explicit_savings, 2),
+            needs_pct=pct_spend(needs),
+            wants_pct=pct_spend(wants),
+            savings_pct=pct_spend(explicit_savings),
         )
 
     residual = income - needs - wants - explicit_savings
@@ -74,6 +92,7 @@ def compute_split(transactions: list[Transaction]) -> SplitResult:
         return round(amount / income * 100, 1)
 
     return SplitResult(
+        mode="income_based",
         income_chf=round(income, 2),
         needs_chf=round(needs, 2),
         wants_chf=round(wants, 2),
