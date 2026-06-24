@@ -47,7 +47,7 @@ class DBBankingProvider(BankingProvider):
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
         rows = self._conn.execute(
             "SELECT id, account_id, amount, currency, merchant, category, "
-            "line_category, ts, import_batch_id, external_fingerprint "
+            "line_category, normalized_category, ts, import_batch_id, external_fingerprint "
             "FROM transactions WHERE account_id=? AND ts >= ? ORDER BY ts DESC",
             (account_id, cutoff),
         ).fetchall()
@@ -55,8 +55,9 @@ class DBBankingProvider(BankingProvider):
             Transaction(
                 id=r[0], account_id=r[1], amount=r[2], currency=r[3],
                 merchant=r[4], category=r[5], line_category=r[6],
-                ts=datetime.fromisoformat(r[7]),
-                import_batch_id=r[8], external_fingerprint=r[9],
+                normalized_category=r[7],
+                ts=datetime.fromisoformat(r[8]),
+                import_batch_id=r[9], external_fingerprint=r[10],
             )
             for r in rows
         ]
@@ -73,11 +74,12 @@ class DBBankingProvider(BankingProvider):
         self._conn.execute(
             "INSERT OR IGNORE INTO transactions"
             "(id, account_id, amount, currency, merchant, category, line_category, "
-            "ts, import_batch_id, external_fingerprint) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "normalized_category, ts, import_batch_id, external_fingerprint) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (
                 txn.id, txn.account_id, txn.amount, txn.currency,
                 txn.merchant, txn.category, txn.line_category,
+                txn.normalized_category,
                 txn.ts.isoformat(), txn.import_batch_id, txn.external_fingerprint,
             ),
         )

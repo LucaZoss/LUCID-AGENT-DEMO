@@ -55,6 +55,7 @@ class DashboardPayload:
     income_chf: float
     total_outflow_chf: float
     net_chf: float                          # income − outflow
+    normalized_breakdown: dict[str, float] | None  # {norm_key: chf_amount}
 
 
 def build_dashboard_payload(
@@ -150,6 +151,15 @@ def build_dashboard_payload(
             "months_remaining":   feasibility.months_remaining,
         }
 
+    # ── Normalized category breakdown ─────────────────────────────────────────
+    norm_totals: dict[str, float] = defaultdict(float)
+    for t in transactions:
+        if t.amount >= 0:
+            continue
+        if t.normalized_category:
+            norm_totals[t.normalized_category] += abs(t.amount)
+    normalized_breakdown = {k: round(v, 2) for k, v in norm_totals.items()} if norm_totals else None
+
     total_outflow = round(split.needs_chf + split.wants_chf + split.explicit_savings_chf, 2)
 
     return DashboardPayload(
@@ -163,4 +173,5 @@ def build_dashboard_payload(
         income_chf=split.income_chf,
         total_outflow_chf=total_outflow,
         net_chf=round(split.income_chf - total_outflow, 2),
+        normalized_breakdown=normalized_breakdown,
     )

@@ -152,7 +152,7 @@ def _recent_turns(conn, conversation_id: str) -> list[dict]:
 def _recent_transactions(conn, user_id: str, days: int) -> list[Transaction]:
     rows = conn.execute(
         "SELECT t.id, t.account_id, t.amount, t.currency, t.merchant, t.category, "
-        "t.line_category, t.ts, t.import_batch_id, t.external_fingerprint "
+        "t.line_category, t.normalized_category, t.ts, t.import_batch_id, t.external_fingerprint "
         "FROM transactions t JOIN accounts a ON t.account_id=a.id "
         "WHERE a.user_id=? AND t.ts >= datetime('now', ?) ORDER BY t.ts",
         (user_id, f"-{days} days"),
@@ -161,8 +161,9 @@ def _recent_transactions(conn, user_id: str, days: int) -> list[Transaction]:
         Transaction(
             id=r[0], account_id=r[1], amount=r[2], currency=r[3],
             merchant=r[4], category=r[5], line_category=r[6],
-            ts=datetime.fromisoformat(r[7]),
-            import_batch_id=r[8], external_fingerprint=r[9],
+            normalized_category=r[7],
+            ts=datetime.fromisoformat(r[8]),
+            import_batch_id=r[9], external_fingerprint=r[10],
         )
         for r in rows
     ]

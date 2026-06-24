@@ -69,3 +69,76 @@ def test_propose_and_apply(conn) -> None:
     ).fetchone()
     assert row[0] == "need"
     assert row[1] == "groceries"
+
+
+def test_propose_normalized_category(conn) -> None:
+    r = ledger_tools.propose_normalized_category(
+        conn, "u1", "t1", "Coop", "groceries_food", rationale="test",
+    )
+    assert r["ok"] is True
+    assert r["proposed_normalized"] == "groceries_food"
+    # Verify it's stored in category_proposals
+    row = conn.execute(
+        "SELECT proposed_normalized FROM category_proposals WHERE txn_id=?",
+        ("t1",),
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "groceries_food"
+
+
+def test_propose_normalized_category_accepts_custom(conn) -> None:
+    r = ledger_tools.propose_normalized_category(
+        conn, "u1", "t1", "Coop", "my_custom_category",
+    )
+    assert r["ok"] is True
+    assert r["proposed_normalized"] == "my_custom_category"
+
+
+def test_propose_normalized_category_invalid_txn(conn) -> None:
+    r = ledger_tools.propose_normalized_category(
+        conn, "u1", "nonexistent", "Coop", "restaurants",
+    )
+    assert r["ok"] is False
+
+
+def test_apply_proposal_with_normalized_override(conn) -> None:
+    r = ledger_tools.propose_normalized_category(
+        conn, "u1", "t1", "Coop", "groceries_food",
+    )
+    pid = r["proposal_id"]
+    ap = ledger_tools.apply_proposal(
+        conn, "u1", pid, normalized_override="restaurants",
+    )
+    assert ap["ok"] is True
+    row = conn.execute(
+        "SELECT normalized_category, category FROM transactions WHERE id=?",
+        ("t1",),
+    ).fetchone()
+    # normalized_category should be the override
+    assert row[0] == "restaurants"
+    # legacy bucket derived from 'restaurants' → 'want'
+    assert row[1] == "want"
+
+
+def test_apply_proposal_normalized_derives_legacy_bucket(conn) -> None:
+    r = ledger_tools.propose_normalized_category(
+        conn, "u1", "t1", "Migros", "groceries_food",
+    )
+    pid = r["proposal_id"]
+    ap = ledger_tools.apply_proposal(conn, "u1", pid)
+    assert ap["ok"] is True
+    row = conn.execute(
+        "SELECT normalized_category, category FROM transactions WHERE id=?",
+        ("t1",),
+    ).fetchone()
+    assert row[0] == "groceries_food"
+    assert row[1] == "need"  # Needs → need
+
+
+def test_list_pending_proposals_includes_normalized(conn) -> None:
+    ledger_tools.propose_normalized_category(
+        conn, "u1", "t1", "Coop", "groceries_food",
+    )
+    proposals = ledger_tools.list_pending_proposals(conn, "u1")
+    assert len(proposals) == 1
+    assert proposals[0]["proposed_normalized"] == "groceries_food"

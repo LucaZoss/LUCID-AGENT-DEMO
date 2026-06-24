@@ -9,7 +9,9 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-# Closed vocabulary aligned with SimulatedBank / budget line items (plan).
+from categories import derive_legacy_bucket
+
+# Legacy raw vocabulary — kept for backward compatibility with old proposals.
 LINE_CATEGORY_VOCABULARY: frozenset[str] = frozenset({
     "rent",
     "health_insurance",
@@ -144,12 +146,48 @@ def propose_line_category(
     }
 
 
+def propose_normalized_category(
+    conn: sqlite3.Connection,
+    user_id: str,
+    txn_id: str,
+    merchant: str,
+    proposed_normalized: str,
+    *,
+    rationale: str = "",
+) -> dict[str, Any]:
+    """Record a normalized taxonomy category proposal for one transaction.
+
+    Accepts any key from the canonical taxonomy OR any custom user string.
+    Does not reject unknown keys so users can define their own categories.
+    """
+    ok, amount, db_merchant = _txn_exists_for_user(conn, user_id, txn_id)
+    if not ok:
+        return {"ok": False, "error": "transaction not found"}
+    norm = proposed_normalized.strip()
+    if not norm:
+        return {"ok": False, "error": "proposed_normalized must be non-empty"}
+    pid = _get_or_create_pending_id(conn, user_id, txn_id)
+    conn.execute(
+        "UPDATE category_proposals SET proposed_normalized=?, "
+        "rationale=COALESCE(?, rationale) WHERE id=?",
+        (norm, rationale or None, pid),
+    )
+    conn.commit()
+    return {
+        "ok": True,
+        "proposal_id": pid,
+        "txn_id": txn_id,
+        "merchant": merchant or db_merchant,
+        "proposed_normalized": norm,
+    }
+
+
 def list_pending_proposals(
     conn: sqlite3.Connection, user_id: str, limit: int = 50
 ) -> list[dict[str, Any]]:
     rows = conn.execute(
-        "SELECT p.id, p.txn_id, p.proposed_bucket, p.proposed_line, p.rationale, "
-        "p.created_at, t.merchant, t.amount "
+        "SELECT p.id, p.txn_id, p.proposed_bucket, p.proposed_line, "
+        "p.proposed_normalized, p.rationale, p.created_at, t.merchant, t.amount "
         "FROM category_proposals p "
         "JOIN transactions t ON p.txn_id=t.id "
         "JOIN accounts a ON t.account_id=a.id "
@@ -163,10 +201,11 @@ def list_pending_proposals(
             "txn_id": r[1],
             "proposed_bucket": r[2],
             "proposed_line": r[3],
-            "rationale": r[4],
-            "created_at": r[5],
-            "merchant": r[6],
-            "amount": r[7],
+            "proposed_normalized": r[4],
+            "rationale": r[5],
+            "created_at": r[6],
+            "merchant": r[7],
+            "amount": r[8],
         }
         for r in rows
     ]
@@ -179,33 +218,36 @@ def apply_proposal(
     *,
     bucket_override: str | None = None,
     line_override: str | None = None,
+    normalized_override: str | None = None,
 ) -> dict[str, Any]:
     """Accept proposal (with optional edits) and UPDATE transactions."""
     row = conn.execute(
-        "SELECT p.txn_id, p.proposed_bucket, p.proposed_line FROM category_proposals p "
+        "SELECT p.txn_id, p.proposed_bucket, p.proposed_line, p.proposed_normalized "
+        "FROM category_proposals p "
         "WHERE p.id=? AND p.user_id=? AND p.status='pending'",
         (proposal_id, user_id),
     ).fetchone()
     if not row:
         return {"ok": False, "error": "proposal not found or not pending"}
-    txn_id, pb, pl = row
-    bucket = (bucket_override or pb or "").strip().lower()
+    txn_id, pb, pl, pn = row
+    normalized = (normalized_override or pn or "").strip() or None
+    bucket = (bucket_override or pb or "").strip().lower() or None
     line = (line_override or pl or "").strip().lower().replace(" ", "_") or None
+    # Derive legacy bucket from normalized_category when bucket is absent
+    if normalized and not bucket:
+        bucket = derive_legacy_bucket(normalized)
     if bucket and bucket not in NWS_BUCKETS:
         return {"ok": False, "error": f"invalid bucket: {bucket!r}"}
-    if line and line not in LINE_CATEGORY_VOCABULARY:
-        return {"ok": False, "error": f"invalid line: {line!r}"}
-    if not bucket and not line:
+    # Accept custom line values — do not reject strings outside LINE_CATEGORY_VOCABULARY
+    if not normalized and not bucket and not line:
         return {"ok": False, "error": "nothing to apply"}
     if bucket:
-        conn.execute(
-            "UPDATE transactions SET category=? WHERE id=?",
-            (bucket, txn_id),
-        )
+        conn.execute("UPDATE transactions SET category=? WHERE id=?", (bucket, txn_id))
     if line:
+        conn.execute("UPDATE transactions SET line_category=? WHERE id=?", (line, txn_id))
+    if normalized:
         conn.execute(
-            "UPDATE transactions SET line_category=? WHERE id=?",
-            (line, txn_id),
+            "UPDATE transactions SET normalized_category=? WHERE id=?", (normalized, txn_id)
         )
     conn.execute(
         "UPDATE category_proposals SET status='accepted' WHERE id=?",
@@ -220,21 +262,28 @@ def apply_proposal(
     merchant_row = conn.execute(
         "SELECT lower(trim(merchant)) FROM transactions WHERE id=?", (txn_id,)
     ).fetchone()
-    if merchant_row and (bucket or line):
+    if merchant_row and (bucket or line or normalized):
         merchant_norm = merchant_row[0]
         conn.execute(
             "INSERT OR REPLACE INTO merchant_category_overrides "
-            "(id, user_id, merchant_normalized, bucket, line_category, updated_at) "
+            "(id, user_id, merchant_normalized, bucket, line_category, normalized_category, updated_at) "
             "VALUES ("
             "  COALESCE("
             "    (SELECT id FROM merchant_category_overrides"
             "     WHERE user_id=? AND merchant_normalized=?),"
             "    lower(hex(randomblob(16)))"
-            "  ), ?, ?, ?, ?, datetime('now'))",
-            (user_id, merchant_norm, user_id, merchant_norm, bucket or None, line or None),
+            "  ), ?, ?, ?, ?, ?, datetime('now'))",
+            (user_id, merchant_norm, user_id, merchant_norm,
+             bucket or None, line or None, normalized or None),
         )
     conn.commit()
-    return {"ok": True, "txn_id": txn_id, "category": bucket or None, "line_category": line}
+    return {
+        "ok": True,
+        "txn_id": txn_id,
+        "category": bucket or None,
+        "line_category": line,
+        "normalized_category": normalized,
+    }
 
 
 def reject_proposal(conn: sqlite3.Connection, user_id: str, proposal_id: str) -> bool:

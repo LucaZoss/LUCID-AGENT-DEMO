@@ -20,6 +20,7 @@ def _txn(
     amount: float,
     category: str | None = None,
     txn_id: str = "t-000",
+    normalized_category: str | None = None,
 ) -> Transaction:
     return Transaction(
         id=txn_id,
@@ -28,6 +29,7 @@ def _txn(
         currency="CHF",
         merchant=merchant,
         category=category,
+        normalized_category=normalized_category,
         ts=datetime.now(timezone.utc),
     )
 
@@ -200,10 +202,13 @@ class TestComputeSplit:
         assert r.explicit_savings_chf == pytest.approx(500.0)
         assert r.needs_chf == pytest.approx(300.0)
 
-    def test_raises_without_income(self):
+    def test_spend_composition_mode_without_income(self):
+        # No income → spend_composition mode; percentages are share of total spend
         txns = [_txn("Coop", -100.0, "need")]
-        with pytest.raises(ValueError, match="No income"):
-            compute_split(txns)
+        r = compute_split(txns)
+        assert r.mode == "spend_composition"
+        assert r.needs_pct == pytest.approx(100.0)
+        assert r.wants_pct == pytest.approx(0.0)
 
     def test_needs_pct_formula(self):
         r = compute_split(self._simple_txns())
@@ -218,6 +223,29 @@ class TestComputeSplit:
         r = compute_split(self._simple_txns())
         # hand-verified: residual=6000-2200-250=3550 → 3550/6000*100 = 59.2 %
         assert r.savings_pct == pytest.approx(59.2, abs=0.1)
+
+    def test_normalized_category_takes_priority_over_raw_category(self):
+        # raw category says "want" but normalized_category says "rent" (Needs → need)
+        txns = [
+            _salary(1_000.0),
+            _txn("SomeShop", -200.0, category="want",
+                 normalized_category="rent", txn_id="t-n"),
+        ]
+        r = compute_split(txns)
+        assert r.needs_chf == pytest.approx(200.0)
+        assert r.wants_chf == pytest.approx(0.0)
+
+    def test_income_normalized_category_excluded_from_nws(self):
+        # twint_credit (Extras) → derive_legacy_bucket returns None → skipped
+        txns = [
+            _salary(1_000.0),
+            _txn("Twint", -50.0, category="want",
+                 normalized_category="twint_debit", txn_id="t-twint"),
+        ]
+        r = compute_split(txns)
+        # twint_debit has no NWS bucket → excluded; only income present
+        assert r.needs_chf == pytest.approx(0.0)
+        assert r.wants_chf == pytest.approx(0.0)
 
     def test_overspending_negative_residual(self):
         # outflow (800+400=1200) > income (1000) → residual is -200
@@ -472,3 +500,24 @@ class TestBuildDashboardPayload:
     def test_period_stored_correctly(self):
         result = build_dashboard_payload("2026-05", self._base_txns())
         assert result.period == "2026-05"
+
+    def test_normalized_breakdown_populated_when_normalized_category_set(self):
+        txns = [
+            _salary(7_200.0),
+            _txn("Migros", -500.0, "need", "t-g", normalized_category="groceries_food"),
+            _txn("Tibits",  -150.0, "want", "t-r", normalized_category="restaurants"),
+            _txn("Netflix",  -19.0, "want", "t-d", normalized_category="digital_goods"),
+        ]
+        result = build_dashboard_payload("2026-06", txns)
+        assert result.normalized_breakdown is not None
+        assert result.normalized_breakdown["groceries_food"] == pytest.approx(500.0)
+        assert result.normalized_breakdown["restaurants"] == pytest.approx(150.0)
+        assert result.normalized_breakdown["digital_goods"] == pytest.approx(19.0)
+
+    def test_normalized_breakdown_is_none_without_normalized_category(self):
+        txns = [
+            _salary(7_200.0),
+            _txn("Migros", -500.0, "need", "t-g"),  # no normalized_category
+        ]
+        result = build_dashboard_payload("2026-06", txns)
+        assert result.normalized_breakdown is None

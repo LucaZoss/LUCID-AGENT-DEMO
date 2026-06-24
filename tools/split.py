@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from categories import derive_legacy_bucket
 from contracts import Transaction
 from tools.categorize import categorize_transaction
 
@@ -54,7 +55,17 @@ def compute_split(transactions: list[Transaction]) -> SplitResult:
             income += t.amount
             continue
 
-        cat = t.category if t.category is not None else categorize_transaction(t)
+        # Prefer normalized_category → legacy bucket; fall back to raw category field
+        if t.normalized_category:
+            cat = derive_legacy_bucket(t.normalized_category)
+            if cat is None:
+                # Income or Extras rows (e.g. twint_credit classified as outflow): skip NWS
+                continue
+        elif t.category is not None:
+            cat = t.category
+        else:
+            cat = categorize_transaction(t)
+
         abs_amount = abs(t.amount)
 
         if cat == "need":

@@ -907,6 +907,7 @@ def _cmd_import_mapping(conn: sqlite3.Connection, parts: list[str]) -> None:
 
 def _cmd_review_categories(conn: sqlite3.Connection) -> None:
     from tools.categorize import categorize_transaction
+    from categories import display_path
 
     pending = ledger_tools.list_pending_proposals(conn, _USER_ID, 40)
     if not pending:
@@ -917,6 +918,7 @@ def _cmd_review_categories(conn: sqlite3.Connection) -> None:
     t.add_column("txn_id", max_width=14, overflow="fold")
     t.add_column("merchant", max_width=24, overflow="fold")
     t.add_column("amt")
+    t.add_column("normalized", max_width=22, overflow="fold")
     t.add_column("bucket")
     t.add_column("line")
     t.add_column("det.need")
@@ -931,11 +933,15 @@ def _cmd_review_categories(conn: sqlite3.Connection) -> None:
             ts=datetime.now(timezone.utc),
         )
         det = categorize_transaction(dummy)
+        norm = p.get("proposed_normalized") or "—"
+        if norm != "—":
+            norm = display_path(norm)
         t.add_row(
             p["proposal_id"][:12] + "…",
             p["txn_id"][:12] + "…",
             p["merchant"],
             f"{p['amount']:.2f}",
+            norm,
             p["proposed_bucket"] or "—",
             p["proposed_line"] or "—",
             det,
@@ -943,7 +949,7 @@ def _cmd_review_categories(conn: sqlite3.Connection) -> None:
     _CONSOLE.print(
         Panel(
             t,
-            title="pending proposals (/cat-accept <id> [bucket] [line] | /cat-reject <id>)",
+            title="pending proposals (/cat-accept <id> [normalized key] [bucket] [line] | /cat-reject <id>)",
             border_style=_ACCENT_DEEP,
         )
     )
@@ -952,13 +958,19 @@ def _cmd_review_categories(conn: sqlite3.Connection) -> None:
 def _cmd_cat_accept(conn: sqlite3.Connection, parts: list[str]) -> None:
     if len(parts) < 2:
         _CONSOLE.print(
-            f"[{_DIM_TEXT}]Usage: /cat-accept <proposal_id> [bucket need] [line groceries][/{_DIM_TEXT}]"
+            f"[{_DIM_TEXT}]Usage: /cat-accept <proposal_id> "
+            f"[normalized groceries_food] [bucket need] [line groceries][/{_DIM_TEXT}]"
         )
         return
     pid = parts[1]
     bucket_o: str | None = None
     line_o: str | None = None
-    # optional: /cat-accept pid bucket need line groceries
+    normalized_o: str | None = None
+    # optional overrides: /cat-accept pid normalized groceries_food bucket need line groceries
+    if "normalized" in parts:
+        i = parts.index("normalized")
+        if i + 1 < len(parts):
+            normalized_o = parts[i + 1]
     if "bucket" in parts:
         i = parts.index("bucket")
         if i + 1 < len(parts):
@@ -968,7 +980,8 @@ def _cmd_cat_accept(conn: sqlite3.Connection, parts: list[str]) -> None:
         if i + 1 < len(parts):
             line_o = parts[i + 1]
     res = ledger_tools.apply_proposal(
-        conn, _USER_ID, pid, bucket_override=bucket_o, line_override=line_o,
+        conn, _USER_ID, pid,
+        bucket_override=bucket_o, line_override=line_o, normalized_override=normalized_o,
     )
     if res.get("ok"):
         _CONSOLE.print(f"[{_GREEN}]Applied: {res}[/{_GREEN}]")
@@ -993,7 +1006,7 @@ def _cmd_rules(conn: sqlite3.Connection, llm, parts: list[str]) -> None:
     if sub == "list":
         rows = conn.execute(
             "SELECT merchant_normalized, canonical_name, bucket, line_category, "
-            "source, confidence, override_count "
+            "normalized_category, source, confidence, override_count "
             "FROM merchant_category_overrides WHERE user_id=? "
             "ORDER BY override_count DESC, updated_at DESC",
             (_USER_ID,),
@@ -1001,9 +1014,11 @@ def _cmd_rules(conn: sqlite3.Connection, llm, parts: list[str]) -> None:
         if not rows:
             _CONSOLE.print(f"[{_DIM_TEXT}]No saved rules yet. Run /rules to create some.[/{_DIM_TEXT}]")
             return
+        from categories import display_path
         t = Table(box=None, show_lines=False, header_style=f"bold {_DIM_TEXT}")
-        t.add_column("Merchant", max_width=30, overflow="fold")
-        t.add_column("Clean name", max_width=22, overflow="fold")
+        t.add_column("Merchant", max_width=26, overflow="fold")
+        t.add_column("Clean name", max_width=18, overflow="fold")
+        t.add_column("Normalized", max_width=22, overflow="fold")
         t.add_column("Bucket", width=8)
         t.add_column("Label", width=18)
         t.add_column("Source", width=16)
@@ -1012,10 +1027,12 @@ def _cmd_rules(conn: sqlite3.Connection, llm, parts: list[str]) -> None:
             bucket_color = {
                 "need": _NEED_COLOR, "want": _WANT_COLOR, "savings": _SAVE_COLOR,
             }.get(r[2] or "", _DIM_TEXT)
+            norm_disp = display_path(r[4]) if r[4] else "—"
             t.add_row(
                 r[0], r[1] or "—",
+                norm_disp,
                 f"[{bucket_color}]{r[2] or '—'}[/{bucket_color}]",
-                r[3] or "—", r[4] or "—", str(r[6] or 0),
+                r[3] or "—", r[5] or "—", str(r[7] or 0),
             )
         _CONSOLE.print(Panel(
             t,
@@ -1171,6 +1188,11 @@ def _cmd_txn_edit(
         f"Press Enter to keep the current value.[/{_DIM_TEXT}]"
     )
 
+    norm_row = conn.execute(
+        "SELECT normalized_category FROM transactions WHERE id=?", (txn_id,)
+    ).fetchone()
+    current_norm = norm_row[0] if norm_row else None
+
     try:
         new_merchant = (
             _CONSOLE.input(f"[{_ACCENT}]Merchant [{merchant}]: [/{_ACCENT}]").strip()
@@ -1184,6 +1206,10 @@ def _cmd_txn_edit(
             f"[{_ACCENT}]Category [{category or '—'}] (need/want/savings): [/{_ACCENT}]"
         ).strip().lower()
         new_cat = cat_input if cat_input in ("need", "want", "savings") else category
+        norm_input = _CONSOLE.input(
+            f"[{_ACCENT}]Normalized category [{current_norm or '—'}] "
+            f"(e.g. groceries_food, restaurants — blank to keep): [/{_ACCENT}]"
+        ).strip() or None
     except (EOFError, KeyboardInterrupt):
         _CONSOLE.print(f"[{_DIM_TEXT}]Cancelled.[/{_DIM_TEXT}]")
         return
@@ -1191,9 +1217,10 @@ def _cmd_txn_edit(
         _CONSOLE.print(f"[{_RED}]{exc}[/{_RED}]")
         return
 
+    new_norm = norm_input if norm_input else current_norm
     conn.execute(
-        "UPDATE transactions SET merchant=?, amount=?, category=? WHERE id=?",
-        (new_merchant, round(new_amount, 2), new_cat, txn_id),
+        "UPDATE transactions SET merchant=?, amount=?, category=?, normalized_category=? WHERE id=?",
+        (new_merchant, round(new_amount, 2), new_cat, new_norm, txn_id),
     )
     conn.execute(
         "UPDATE accounts SET balance = "

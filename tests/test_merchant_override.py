@@ -127,7 +127,7 @@ def test_categorizer_prefills_known_merchant(conn, acc_id):
 
     overrides = _load_merchant_overrides(conn, "u1")
     assert "coop" in overrides
-    assert overrides["coop"] == ("need", "groceries")
+    assert overrides["coop"] == ("need", "groceries", None)
 
     # Simulate what the categorizer does for known merchants
     propose_spending_bucket(conn, "u1", txn_id, "Coop", "need", rationale="merchant memory")
@@ -164,4 +164,4 @@ def test_load_merchant_overrides_multiple(conn):
 
     overrides = _load_merchant_overrides(conn, "u1")
     assert set(overrides.keys()) == {"migros", "netflix", "viac"}
-    assert overrides["migros"] == ("need", None)
+    assert overrides["migros"] == ("need", None, None)

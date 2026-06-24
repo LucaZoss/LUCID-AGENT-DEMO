@@ -19,9 +19,10 @@ class Transaction:
     amount: float        # negative = outflow, positive = inflow; CHF
     currency: str        # 'CHF' in the demo
     merchant: str
-    category: str | None  # 'need' | 'want' | 'savings' — set by categorizer
+    category: str | None  # raw: 'need' | 'want' | 'savings' (legacy bucket)
     ts: datetime
-    line_category: str | None = None  # fine label: rent, groceries, …
+    line_category: str | None = None        # raw: fine label e.g. rent, groceries
+    normalized_category: str | None = None  # canonical taxonomy key e.g. 'groceries_food'
     import_batch_id: str | None = None
     external_fingerprint: str | None = None  # CSV dedupe key
 

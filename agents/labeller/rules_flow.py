@@ -70,20 +70,38 @@ Classify the merchant as one of:
   expense  — any outgoing payment
 
 For expense, also set "bucket" to one of: need | want | savings
-  need     — essential: rent, groceries, health insurance, transport, utilities, insurance
-  want     — discretionary: dining, bars, entertainment, shopping, travel, sports
+  need     — essential: rent, groceries, health insurance, telecom, transport
+  want     — discretionary: restaurants, clothing, digital goods, travel, sports
   savings  — investment, pillar 3a, savings transfer
 
-For "line_category" pick the single best label from this list:
-  salary, refund, rent, health_insurance, groceries, transport, telecom,
-  utilities, dining, coffee, entertainment, clothing, electronics, pharmacy,
-  bars, streaming, savings_transfer, investment, other
+For "line_category" pick the EXACT key from this canonical taxonomy:
+
+  Expenses / Needs:
+    rent, health_insurance, groceries_food, telecom
+
+  Expenses / Wants:
+    car, clothing, digital_goods, health_other, housing,
+    restaurants, sports, travel_holidays, transport, wellbeing, wants_other
+
+  Income:
+    salary
+
+  Extras:
+    twint_credit, twint_debit, extras_other
+
+Examples:
+  Coop, Migros, Denner → groceries_food
+  Netflix, Spotify, Adobe, Claude.AI, GitHub → digital_goods
+  Starbucks, McDonald's, Sushi restaurant → restaurants
+  SBB, BLS, Uber → transport
+  Helsana, Swica, CSS, Assura → health_insurance
+  Gym, Fitnesspark, Decathlon → sports
 
 JSON schema (all fields required):
 {
   "type": "income" | "refund" | "expense",
   "bucket": "need" | "want" | "savings" | null,
-  "line_category": "<one label from the list>",
+  "line_category": "<exact key from the taxonomy above>",
   "rationale": "<one sentence>"
 }
 """
@@ -179,7 +197,7 @@ def _propose_rule(llm, group: dict[str, Any]) -> dict[str, Any]:
     if txn_type in ("income", "refund"):
         bucket = None
     if line not in RULE_LINE_CATEGORIES:
-        line = "other"
+        line = "wants_other"
 
     return {
         "type": txn_type,
@@ -193,9 +211,9 @@ def _propose_rule(llm, group: dict[str, Any]) -> dict[str, Any]:
 def _fallback_proposal(group: dict[str, Any]) -> dict[str, Any]:
     """Deterministic fallback when the LLM call fails."""
     if group["total_amount"] > 0:
-        return {"type": "income", "bucket": None, "line_category": "income",
+        return {"type": "income", "bucket": None, "line_category": "salary",
                 "rationale": "positive balance (auto-fallback)", "llm_ok": False}
-    return {"type": "expense", "bucket": "want", "line_category": "other",
+    return {"type": "expense", "bucket": "want", "line_category": "wants_other",
             "rationale": "unknown merchant (auto-fallback)", "llm_ok": False}
 
 
@@ -384,7 +402,7 @@ def _show_rule_hitl(
             elif v not in _VALID_BUCKETS:
                 console.print(f"  [dim yellow]Unknown bucket '{v}' — use need/want/savings.[/dim yellow]")
         if "l" in direct:
-            v = direct["l"].replace(" ", "_")
+            v = direct["l"].replace(" ", "_").replace("-", "_")
             if v in RULE_LINE_CATEGORIES:
                 line = v
             else:
@@ -430,15 +448,19 @@ def _apply_and_save_rule(
     line_category: str,
 ) -> int:
     """Update matching transactions + upsert merchant_category_overrides."""
+    from categories import is_valid_key
+    from categories_mapping import map_from_line_category
+
+    norm_cat = line_category if is_valid_key(line_category) else map_from_line_category(line_category)
     now = datetime.now(timezone.utc).isoformat()
 
     # No category IS NULL guard — user-confirmed rules override bulk onboarding assignments.
     cur = conn.execute(
         "UPDATE transactions "
-        "SET category = ?, line_category = ? "
+        "SET category = ?, line_category = ?, normalized_category = ? "
         "WHERE lower(trim(merchant)) = ? "
         "AND account_id IN (SELECT id FROM accounts WHERE user_id = ?)",
-        (bucket, line_category, merchant_key, user_id),
+        (bucket, line_category, norm_cat, merchant_key, user_id),
     )
     n_updated = cur.rowcount
 
@@ -453,19 +475,19 @@ def _apply_and_save_rule(
     if existing:
         conn.execute(
             "UPDATE merchant_category_overrides "
-            "SET canonical_name=?, bucket=?, line_category=?, "
+            "SET canonical_name=?, bucket=?, line_category=?, normalized_category=?, "
             "source='user_confirmed', confidence=1.0, updated_at=? "
             "WHERE id=?",
-            (canonical, bucket, line_category, now, existing[0]),
+            (canonical, bucket, line_category, norm_cat, now, existing[0]),
         )
     else:
         conn.execute(
             "INSERT INTO merchant_category_overrides "
             "(id, user_id, merchant_normalized, canonical_name, bucket, "
-            "line_category, source, confidence, override_count, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'user_confirmed', 1.0, 0, ?)",
+            "line_category, normalized_category, source, confidence, override_count, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'user_confirmed', 1.0, 0, ?)",
             (str(uuid.uuid4()), user_id, merchant_key, canonical,
-             bucket, line_category, now),
+             bucket, line_category, norm_cat, now),
         )
 
     conn.commit()

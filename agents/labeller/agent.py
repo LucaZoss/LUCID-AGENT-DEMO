@@ -32,9 +32,26 @@ from agents.labeller import tools as _tools
 
 _SYSTEM = """\
 You are the Labeller Agent for LUCID personal finance.
-Your job: assign a human-readable *line_category* (e.g. "Grocery Stores",
-"Electronics Stores", "Streaming Services") and a clean merchant name to every
-uncategorized outflow transaction imported from CSV.
+Your job: assign a normalized *line_category* key and a clean merchant name to
+every uncategorized outflow transaction imported from CSV.
+
+Use EXACTLY one of these canonical taxonomy keys for line_category:
+
+  Expenses / Needs:   rent  health_insurance  groceries_food  telecom
+  Expenses / Wants:   car  clothing  digital_goods  health_other  housing
+                      restaurants  sports  travel_holidays  transport
+                      wellbeing  wants_other
+  Income:             salary
+  Extras:             twint_credit  twint_debit  extras_other
+
+Classification examples (use these as reference):
+  Coop, Migros, Aldi, Denner → groceries_food
+  Netflix, Spotify, Disney+, Adobe, GitHub, Claude.AI, Anthropic → digital_goods
+  Starbucks, McDonald's, any restaurant → restaurants
+  SBB, BLS, ZVV, Uber → transport
+  Helsana, Swica, CSS, Assura → health_insurance
+  Fitnesspark, Gym, Decathlon → sports
+  Digitec, Galaxus, MediaMarkt → digital_goods
 
 CRITICAL RULES:
 - Do NOT narrate what you are about to do. Do NOT write step-by-step plans.
@@ -44,10 +61,9 @@ CRITICAL RULES:
 - Your ONLY text output is the final one-line summary after apply_labels completes
   (e.g. "Labelled 50 transactions, 3 rules saved.").
 - Do NOT classify into need / want / savings. That is the budget agent's job.
-- Propose descriptive merchant-type labels only ("Restaurants", "Pharmacies", …).
 - Never invent financial amounts or do arithmetic.
-- Use your world knowledge when propose_line_category returns confidence=0.
-- For truly ambiguous merchants, default to a broad label like "Shopping".
+- When propose_line_category returns confidence=0, use your world knowledge to
+  pick the best taxonomy key. Default to wants_other only when truly ambiguous.
 
 Tool call sequence (no text between steps):
 1. fetch_unlabelled
@@ -130,9 +146,11 @@ _TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "propose_line_category",
             "description": (
-                "Return a proposed descriptive line_category for a merchant. "
+                "Return a proposed normalized taxonomy key (e.g. 'restaurants', "
+                "'groceries_food', 'digital_goods') for a merchant. "
                 "Uses sector_hint from CSV if available, then merchant rules. "
-                "Returns line_category=null when unknown — use your own judgment then."
+                "Returns line_category=null when unknown — use your own judgment then, "
+                "picking the best key from the canonical taxonomy."
             ),
             "parameters": {
                 "type": "object",

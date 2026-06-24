@@ -112,8 +112,9 @@ CREATE TABLE IF NOT EXISTS transactions (
     currency        TEXT NOT NULL DEFAULT 'CHF',
     merchant        TEXT NOT NULL,
     clean_name      TEXT,             -- normalised merchant name set by Labeller agent
-    category        TEXT,             -- need|want|savings, set by categorizer
-    line_category   TEXT,            -- rent|groceries|… (optional fine label)
+    category        TEXT,             -- raw: need|want|savings (legacy bucket)
+    line_category   TEXT,             -- raw: rent|groceries|… (legacy fine label)
+    normalized_category TEXT,         -- canonical taxonomy key, e.g. 'groceries_food'
     ts              TEXT NOT NULL,
     import_batch_id TEXT REFERENCES import_batches(id),
     external_fingerprint TEXT       -- dedupe key for CSV imports
@@ -128,8 +129,9 @@ CREATE TABLE IF NOT EXISTS category_proposals (
     id              TEXT PRIMARY KEY,
     user_id         TEXT NOT NULL REFERENCES users(id),
     txn_id          TEXT NOT NULL REFERENCES transactions(id),
-    proposed_bucket TEXT,             -- need|want|savings
-    proposed_line   TEXT,             -- closed vocabulary line label
+    proposed_bucket     TEXT,         -- raw: need|want|savings (legacy)
+    proposed_line       TEXT,         -- raw: closed vocabulary line label (legacy)
+    proposed_normalized TEXT,         -- canonical taxonomy key, e.g. 'restaurants'
     rationale       TEXT,
     status          TEXT NOT NULL DEFAULT 'pending',  -- pending|accepted|rejected
     created_at      TEXT NOT NULL
@@ -141,8 +143,9 @@ CREATE TABLE IF NOT EXISTS merchant_category_overrides (
     user_id             TEXT NOT NULL REFERENCES users(id),
     merchant_normalized TEXT NOT NULL,  -- raw pattern matched against transaction merchant
     canonical_name      TEXT,           -- clean display name set by Labeller agent
-    bucket              TEXT,           -- need|want|savings
-    line_category       TEXT,
+    bucket              TEXT,           -- raw: need|want|savings (legacy)
+    line_category       TEXT,           -- raw: fine label (legacy)
+    normalized_category TEXT,           -- canonical taxonomy key, e.g. 'groceries_food'
     -- Labeller agent memory fields
     source              TEXT NOT NULL DEFAULT 'user_confirmed',
                         -- 'user_confirmed' | 'sector_rule' | 'llm_proposed'
@@ -235,6 +238,9 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     # Sub-plan 1: clean_name column for Labeller agent
     if "clean_name" not in cols:
         conn.execute("ALTER TABLE transactions ADD COLUMN clean_name TEXT")
+    # Normalized category taxonomy
+    if "normalized_category" not in cols:
+        conn.execute("ALTER TABLE transactions ADD COLUMN normalized_category TEXT")
 
     # Partial unique index (may fail on very old SQLite — ignore if exists)
     conn.execute(
@@ -293,6 +299,19 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "ALTER TABLE merchant_category_overrides "
                 "ADD COLUMN override_count INTEGER NOT NULL DEFAULT 0"
+            )
+        if "normalized_category" not in mco_cols:
+            conn.execute(
+                "ALTER TABLE merchant_category_overrides "
+                "ADD COLUMN normalized_category TEXT"
+            )
+
+    # category_proposals: add proposed_normalized for taxonomy proposals
+    if "category_proposals" in tables:
+        prop_cols = _table_columns(conn, "category_proposals")
+        if "proposed_normalized" not in prop_cols:
+            conn.execute(
+                "ALTER TABLE category_proposals ADD COLUMN proposed_normalized TEXT"
             )
 
     # accounts columns added for multi-account support

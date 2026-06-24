@@ -20,122 +20,111 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
+from categories import VALID_KEYS, is_valid_key
 from tools.labeller.name_cleaner import clean_merchant_name
 
-# Merchant-substring → descriptive line_category (ordered, first match wins).
-# These mirror the intent of tools/categorize.py but produce human-readable
-# labels rather than need/want/savings buckets.
-# Extended vocabulary for the /rules flow — includes inflow types not in ledger_tools.
-RULE_LINE_CATEGORIES: frozenset[str] = frozenset({
-    "rent", "health_insurance", "groceries", "transport", "telecom",
-    "utilities", "dining", "coffee", "entertainment", "clothing",
-    "electronics", "pharmacy", "bars", "streaming", "savings_transfer", "other",
-    "salary", "refund", "income", "investment",
-})
+# Vocabulary for the /rules flow: the canonical normalized taxonomy keys.
+RULE_LINE_CATEGORIES: frozenset[str] = VALID_KEYS
 
+# Merchant-substring → normalized_category key (ordered, first match wins).
 _MERCHANT_LINE_RULES: list[tuple[str, str]] = [
-    # Savings / investments
-    ("viac", "Investment & Savings"),
-    ("frankly", "Investment & Savings"),
-    ("degiro", "Investment & Savings"),
-    ("swissquote", "Investment & Savings"),
-    ("pillar", "Investment & Savings"),
     # Groceries & supermarkets
-    ("coop", "Grocery Stores"),
-    ("migros", "Grocery Stores"),
-    ("aldi", "Grocery Stores"),
-    ("lidl", "Grocery Stores"),
-    ("denner", "Grocery Stores"),
-    ("volg", "Grocery Stores"),
-    ("spar", "Grocery Stores"),
+    ("coop",           "groceries_food"),
+    ("migros",         "groceries_food"),
+    ("aldi",           "groceries_food"),
+    ("lidl",           "groceries_food"),
+    ("denner",         "groceries_food"),
+    ("volg",           "groceries_food"),
+    ("spar",           "groceries_food"),
     # Pharmacies & health
-    ("apotheke", "Pharmacies"),
-    ("pharmacy", "Pharmacies"),
-    ("pharmacie", "Pharmacies"),
-    ("medikament", "Pharmacies"),
-    ("drogerien", "Pharmacies"),
-    # Coffee shops
-    ("starbucks", "Coffee Shops"),
-    ("caffè nero", "Coffee Shops"),
-    ("paul", "Coffee Shops"),
-    # Restaurants & food delivery
-    ("mcdonalds", "Restaurants"),
-    ("mc donalds", "Restaurants"),
-    ("burger king", "Restaurants"),
-    ("kfc", "Restaurants"),
-    ("subway", "Restaurants"),
-    ("pizza", "Restaurants"),
-    ("sushi", "Restaurants"),
-    ("doordash", "Food Delivery"),
-    ("uber eats", "Food Delivery"),
-    ("just eat", "Food Delivery"),
-    ("smood", "Food Delivery"),
-    # Streaming & subscriptions
-    ("netflix", "Streaming Services"),
-    ("spotify", "Streaming Services"),
-    ("disney", "Streaming Services"),
-    ("apple tv", "Streaming Services"),
-    ("youtube", "Streaming Services"),
-    ("amazon prime", "Streaming Services"),
-    # Software & apps
-    ("apple.com", "Apps & Software"),
-    ("google play", "Apps & Software"),
-    ("adobe", "Apps & Software"),
-    ("microsoft", "Apps & Software"),
-    ("github", "Apps & Software"),
-    # Electronics & online shopping
-    ("techshop", "Electronics Stores"),
-    ("digitec", "Electronics Stores"),
-    ("galaxus", "Electronics Stores"),
-    ("mediamarkt", "Electronics Stores"),
-    ("amazon", "Online Shopping"),
-    ("zalando", "Clothing & Fashion"),
-    ("zara", "Clothing & Fashion"),
-    ("h&m", "Clothing & Fashion"),
-    # Transport
-    ("sbb", "Public Transport"),
-    ("bls", "Public Transport"),
-    ("zkb", "Banking Fees"),
-    ("postauto", "Public Transport"),
-    ("uber", "Ride-hailing"),
-    ("lyft", "Ride-hailing"),
-    ("taxis", "Ride-hailing"),
-    ("taxi", "Ride-hailing"),
-    # Fuel
-    ("shell", "Fuel & Gas"),
-    ("bp ", "Fuel & Gas"),
-    ("esso", "Fuel & Gas"),
-    ("agrola", "Fuel & Gas"),
-    ("tamoil", "Fuel & Gas"),
-    # Utilities & telecoms
-    ("sunrise", "Telecommunications"),
-    ("salt", "Telecommunications"),
-    ("swisscom", "Telecommunications"),
-    ("ewz", "Utilities"),
-    ("ckw", "Utilities"),
-    # Insurance
-    ("swica", "Insurance"),
-    ("helsana", "Insurance"),
-    ("css", "Insurance"),
-    ("assura", "Insurance"),
-    ("concordia", "Insurance"),
-    ("mobiliar", "Insurance"),
-    # Fitness & sports
-    ("gym", "Fitness & Sports"),
-    ("fitnesspark", "Fitness & Sports"),
-    ("migros sport", "Fitness & Sports"),
-    # Travel & accommodation
-    ("airbnb", "Accommodation"),
-    ("booking.com", "Accommodation"),
-    ("hotels.com", "Accommodation"),
-    ("lufthansa", "Flights"),
-    ("swiss air", "Flights"),
-    ("easyjet", "Flights"),
-    ("ryanair", "Flights"),
+    ("apotheke",       "health_other"),
+    ("pharmacy",       "health_other"),
+    ("pharmacie",      "health_other"),
+    ("medikament",     "health_other"),
+    ("drogerien",      "health_other"),
+    # Restaurants & food delivery (coffee shops included)
+    ("starbucks",      "restaurants"),
+    ("caffè nero",     "restaurants"),
+    ("mcdonalds",      "restaurants"),
+    ("mc donalds",     "restaurants"),
+    ("burger king",    "restaurants"),
+    ("kfc",            "restaurants"),
+    ("subway",         "restaurants"),
+    ("pizza",          "restaurants"),
+    ("sushi",          "restaurants"),
+    ("doordash",       "restaurants"),
+    ("uber eats",      "restaurants"),
+    ("just eat",       "restaurants"),
+    ("smood",          "restaurants"),
+    # Streaming, software & digital goods
+    ("netflix",        "digital_goods"),
+    ("spotify",        "digital_goods"),
+    ("disney",         "digital_goods"),
+    ("apple tv",       "digital_goods"),
+    ("youtube",        "digital_goods"),
+    ("amazon prime",   "digital_goods"),
+    ("apple.com",      "digital_goods"),
+    ("google play",    "digital_goods"),
+    ("adobe",          "digital_goods"),
+    ("microsoft",      "digital_goods"),
+    ("github",         "digital_goods"),
+    ("anthropic",      "digital_goods"),
+    ("openai",         "digital_goods"),
+    ("chatgpt",        "digital_goods"),
+    # Electronics stores (also digital_goods)
+    ("digitec",        "digital_goods"),
+    ("galaxus",        "digital_goods"),
+    ("mediamarkt",     "digital_goods"),
+    # Online shopping
+    ("amazon",         "wants_other"),
+    # Clothing
+    ("zalando",        "clothing"),
+    ("zara",           "clothing"),
+    ("h&m",            "clothing"),
+    # Transport (public)
+    ("sbb",            "transport"),
+    ("bls",            "transport"),
+    ("postauto",       "transport"),
+    ("uber",           "transport"),
+    ("lyft",           "transport"),
+    ("taxis",          "transport"),
+    ("taxi",           "transport"),
     # Banking fees
-    ("annual fee", "Banking Fees"),
-    ("jahresgebühr", "Banking Fees"),
-    ("kontogebühr", "Banking Fees"),
+    ("zkb",            "extras_other"),
+    ("annual fee",     "extras_other"),
+    ("jahresgebühr",   "extras_other"),
+    ("kontogebühr",    "extras_other"),
+    # Car / fuel
+    ("shell",          "car"),
+    ("bp ",            "car"),
+    ("esso",           "car"),
+    ("agrola",         "car"),
+    ("tamoil",         "car"),
+    # Telecoms
+    ("sunrise",        "telecom"),
+    ("salt",           "telecom"),
+    ("swisscom",       "telecom"),
+    # Utilities / housing
+    ("ewz",            "housing"),
+    ("ckw",            "housing"),
+    # Health insurance (Swiss Krankenkasse)
+    ("swica",          "health_insurance"),
+    ("helsana",        "health_insurance"),
+    ("css versicherung","health_insurance"),
+    ("assura",         "health_insurance"),
+    ("concordia",      "health_insurance"),
+    # Sports & fitness
+    ("gym",            "sports"),
+    ("fitnesspark",    "sports"),
+    ("migros sport",   "sports"),
+    # Travel & accommodation
+    ("airbnb",         "travel_holidays"),
+    ("booking.com",    "travel_holidays"),
+    ("hotels.com",     "travel_holidays"),
+    ("lufthansa",      "travel_holidays"),
+    ("swiss air",      "travel_holidays"),
+    ("easyjet",        "travel_holidays"),
+    ("ryanair",        "travel_holidays"),
 ]
 
 
@@ -173,7 +162,8 @@ def lookup_merchant_memory(
     """Check merchant_category_overrides for a known line_category."""
     key = merchant.strip().lower()
     row = conn.execute(
-        "SELECT canonical_name, bucket, line_category, source, confidence, override_count "
+        "SELECT canonical_name, bucket, line_category, source, confidence, "
+        "override_count, normalized_category "
         "FROM merchant_category_overrides "
         "WHERE user_id=? AND merchant_normalized=?",
         (user_id, key),
@@ -189,6 +179,7 @@ def lookup_merchant_memory(
         "source": row[3],
         "confidence": row[4],
         "override_count": row[5],
+        "normalized_category": row[6],
         # Auto-apply when user explicitly confirmed AND we have a line_category
         "auto_apply": (
             row[3] == "user_confirmed"
@@ -443,7 +434,8 @@ def apply_labels(
     confirmed: list[dict[str, Any]],
     merchant_raw_map: dict[str, str],
 ) -> dict[str, Any]:
-    """Write clean_name + line_category to transactions; upsert merchant_category_overrides.
+    """Write clean_name + line_category + normalized_category to transactions;
+    upsert merchant_category_overrides.
 
     Intentionally does NOT write to the *category* (need/want/savings) column —
     that is the budget agent's responsibility.
@@ -451,6 +443,8 @@ def apply_labels(
     When save_rule=True the merchant override is stored so future imports of the
     same merchant are auto-labelled.
     """
+    from categories_mapping import map_from_line_category
+
     now = datetime.now(timezone.utc).isoformat()
     applied = 0
     rules_saved = 0
@@ -460,10 +454,15 @@ def apply_labels(
         clean_name = item["clean_name"]
         line_category = item.get("line_category") or ""
         save_rule = item.get("save_rule", False)
+        # If the labeller already emits a normalized key, use it directly.
+        if line_category and is_valid_key(line_category):
+            norm_cat = line_category
+        else:
+            norm_cat = map_from_line_category(line_category) if line_category else None
 
         conn.execute(
-            "UPDATE transactions SET clean_name=?, line_category=? WHERE id=?",
-            (clean_name, line_category, txn_id),
+            "UPDATE transactions SET clean_name=?, line_category=?, normalized_category=? WHERE id=?",
+            (clean_name, line_category, norm_cat, txn_id),
         )
         applied += 1
 
@@ -484,10 +483,10 @@ def apply_labels(
             source = "user_confirmed" if save_rule else "labeller_proposed"
             conn.execute(
                 "UPDATE merchant_category_overrides "
-                "SET canonical_name=?, line_category=?, source=?, "
+                "SET canonical_name=?, line_category=?, normalized_category=?, source=?, "
                 "confidence=?, override_count=?, updated_at=? "
                 "WHERE id=?",
-                (clean_name, line_category, source, confidence, new_count, now, existing[0]),
+                (clean_name, line_category, norm_cat, source, confidence, new_count, now, existing[0]),
             )
             if save_rule:
                 rules_saved += 1
@@ -495,9 +494,9 @@ def apply_labels(
             conn.execute(
                 "INSERT INTO merchant_category_overrides("
                 "id, user_id, merchant_normalized, canonical_name, line_category, "
-                "source, confidence, override_count, updated_at"
-                ") VALUES (?,?,?,?,?,'user_confirmed',1.0,0,?)",
-                (str(uuid.uuid4()), user_id, merchant_key, clean_name, line_category, now),
+                "normalized_category, source, confidence, override_count, updated_at"
+                ") VALUES (?,?,?,?,?,?,'user_confirmed',1.0,0,?)",
+                (str(uuid.uuid4()), user_id, merchant_key, clean_name, line_category, norm_cat, now),
             )
             rules_saved += 1
 
