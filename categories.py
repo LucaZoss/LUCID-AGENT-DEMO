@@ -73,6 +73,53 @@ def derive_legacy_bucket(key: str) -> str | None:
     return None
 
 
+def get_effective_taxonomy(
+    conn: object,
+    user_id: str,
+) -> "list[NormalizedCategory]":
+    """Return TAXONOMY merged with user customisations from user_categories.
+
+    Applies in order: hide keys the user removed, override display names,
+    then append any custom keys the user added.
+    """
+    import sqlite3 as _sqlite3
+    try:
+        rows = conn.execute(
+            "SELECT key, name, group_name, top_type, is_override, hidden "
+            "FROM user_categories WHERE user_id=?",
+            (user_id,),
+        ).fetchall()
+    except _sqlite3.OperationalError:
+        # Table may not exist on very old DBs — fall back to default taxonomy.
+        return list(TAXONOMY)
+
+    hidden_keys: set[str] = set()
+    name_overrides: dict[str, str] = {}
+    custom: list[NormalizedCategory] = []
+
+    for key, name, group_name, top_type, is_override, hidden in rows:
+        if hidden:
+            hidden_keys.add(key)
+        elif is_override:
+            name_overrides[key] = name
+        else:
+            custom.append(NormalizedCategory(key, name, group_name, top_type))
+
+    result: list[NormalizedCategory] = []
+    for cat in TAXONOMY:
+        if cat.key in hidden_keys:
+            continue
+        if cat.key in name_overrides:
+            result.append(
+                NormalizedCategory(cat.key, name_overrides[cat.key], cat.group, cat.top_type, cat.description)
+            )
+        else:
+            result.append(cat)
+
+    result.extend(custom)
+    return result
+
+
 def is_valid_key(key: str) -> bool:
     """Return True if key is in the canonical taxonomy."""
     return key in VALID_KEYS

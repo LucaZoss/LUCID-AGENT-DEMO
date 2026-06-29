@@ -188,7 +188,7 @@ def confirm_account_hitl(
         )
     )
 
-    # Prompt for edits.
+    # Prompt for edits — income-bearing is always assumed true.
     try:
         name_in = console.input(
             f"  Account name [[bold]{proposal.name}[/bold]]: "
@@ -200,22 +200,14 @@ def confirm_account_hitl(
         ).strip().lower()
         account_type = type_in if type_in in _VALID_TYPES else proposal.account_type
 
-        inc_in = console.input(
-            f"  Income-bearing? (y/N) [[bold]{'y' if proposal.has_income else 'N'}[/bold]]: "
-        ).strip().lower()
-        if inc_in == "":
-            has_income = proposal.has_income
-        else:
-            has_income = inc_in in ("y", "yes")
-
     except (EOFError, KeyboardInterrupt):
         console.print("  [dim]Account selection cancelled.[/dim]")
         return None
 
     confirmed = AccountProposal(
-        name=name, account_type=account_type, has_income=has_income, confidence="high"
+        name=name, account_type=account_type, has_income=True, confidence="high"
     )
-    account_id = upsert_account(conn, user_id, name, account_type, has_income)
+    account_id = upsert_account(conn, user_id, name, account_type, has_income=True)
     return account_id, confirmed
 
 

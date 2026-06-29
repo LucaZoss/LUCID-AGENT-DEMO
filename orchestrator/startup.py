@@ -26,9 +26,11 @@ class StartupStage(Enum):
     MODEL = "model"
     DATA_SOURCE = "data_source"
     PERSISTENCE = "persistence"
-    ETL_LOADER = "etl_loader"          # Agent 1: CSV discovery, column mapping, import
-    LABELLER = "labeller"              # Agent 2: clean names, classify buckets
-    RULES_REVIEW = "rules_review"      # Agent 3: LLM-assisted rule creation for unlabeled merchants
+    ETL_LOADER = "etl_loader"              # Agent 1: CSV discovery, column mapping, import
+    CATEGORY_SETUP = "category_setup"      # Review/edit taxonomy before labeling
+    LABELLER = "labeller"                  # Agent 2: clean names, classify buckets
+    ENRICH = "enrich"                      # Deterministic enrichment: recurrence, transfers, confidence
+    RULES_REVIEW = "rules_review"          # Agent 3: LLM-assisted rule creation for unlabeled merchants
     BUDGET_ONBOARDING = "budget_onboarding"  # Step 4: assign need/want/savings
     REPL = "repl"
 
@@ -653,10 +655,10 @@ def stage_categorize(console, llm, conn: sqlite3.Connection, user_id: str) -> in
 # ── Stage 6: Summary ──────────────────────────────────────────────────────────
 
 def stage_summary(console, conn: sqlite3.Connection, user_id: str) -> None:
-    """Display accurate aggregate stats computed from imported data. No LLM."""
+    """Display total count, average monthly splits, and last-month vs average. No LLM."""
+    from collections import defaultdict
     from rich.table import Table
     from tools.split import compute_split
-    # Local import to avoid module-level circular dependency
     from orchestrator.router import _fetch_transactions  # type: ignore[attr-defined]
 
     total_count = conn.execute(
@@ -669,66 +671,87 @@ def stage_summary(console, conn: sqlite3.Connection, user_id: str) -> None:
     console.rule("[dim]Import Summary[/dim]")
     console.print(f"  Total transactions in ledger: [bold]{total_count}[/bold]")
 
-    txns = _fetch_transactions(conn, user_id, 90)
-    if txns:
-        income_account_count = conn.execute(
-            "SELECT COUNT(*) FROM accounts WHERE user_id=? AND has_income=1",
-            (user_id,),
-        ).fetchone()[0]
+    # Fetch up to 18 months so averages are meaningful
+    all_txns = _fetch_transactions(conn, user_id, 548)
+    if not all_txns:
+        console.print("  [dim]No transactions to analyse.[/dim]")
+        console.rule()
+        return
+
+    # Group transactions by calendar month
+    monthly: dict[str, list] = defaultdict(list)
+    for t in all_txns:
+        key = t.ts.strftime("%Y-%m") if hasattr(t.ts, "strftime") else str(t.ts)[:7]
+        monthly[key].append(t)
+
+    # Compute split per month; skip months with no usable data
+    splits: dict[str, object] = {}
+    for month in sorted(monthly):
         try:
-            s = compute_split(txns)
-            if s.mode == "spend_composition":
-                console.print(
-                    f"\n  [bold]90-day spending breakdown[/bold] [dim](no income in window)[/dim]\n"
-                    f"  Total spend: CHF [bold]{s.needs_chf + s.wants_chf + s.savings_chf:,.2f}[/bold]\n"
-                    f"  Needs:    {s.needs_pct:.1f}%  (CHF {s.needs_chf:,.2f})\n"
-                    f"  Wants:    {s.wants_pct:.1f}%  (CHF {s.wants_chf:,.2f})\n"
-                    f"  Savings:  {s.savings_pct:.1f}%  (CHF {s.savings_chf:,.2f})"
-                )
-                if not income_account_count:
-                    console.print(
-                        "  [dim]Import a checking or salary account to see "
-                        "ratios relative to income.[/dim]"
-                    )
-            else:
-                console.print(
-                    f"\n  [bold]90-day window[/bold]\n"
-                    f"  Income:   CHF [bold]{s.income_chf:,.2f}[/bold]\n"
-                    f"  Needs:    {s.needs_pct:.1f}%  (CHF {s.needs_chf:,.2f})\n"
-                    f"  Wants:    {s.wants_pct:.1f}%  (CHF {s.wants_chf:,.2f})\n"
-                    f"  Savings:  {s.savings_pct:.1f}%  (CHF {s.savings_chf:,.2f})"
-                )
+            splits[month] = compute_split(monthly[month])
         except ValueError:
-            console.print(
-                "  [dim]No transactions in the last 90 days.[/dim]"
-            )
-    else:
-        console.print("  [dim]No transactions in the last 90 days.[/dim]")
+            pass
 
-    # Monthly charges vs credits — last 6 months
-    rows = conn.execute(
-        "SELECT strftime('%Y-%m', t.ts) AS month, "
-        "  -SUM(CASE WHEN t.amount < 0 THEN t.amount ELSE 0 END) AS charges, "
-        "   SUM(CASE WHEN t.amount > 0 THEN t.amount ELSE 0 END) AS credits "
-        "FROM transactions t JOIN accounts a ON t.account_id=a.id "
-        "WHERE a.user_id=? GROUP BY month ORDER BY month DESC LIMIT 6",
-        (user_id,),
-    ).fetchall()
+    if not splits:
+        console.print("  [dim]Not enough data to compute splits.[/dim]")
+        console.rule()
+        return
 
-    if rows:
-        tbl = Table(title="Monthly spending (last 6 months)", box=None, show_header=True)
-        tbl.add_column("Month", style="dim")
-        tbl.add_column("Charges CHF", justify="right")
-        tbl.add_column("Credits CHF", justify="right", style="dim")
-        for month, charges, credits in rows:
-            tbl.add_row(
-                month,
-                f"[red]{(charges or 0):,.2f}[/red]",
-                f"[green]{(credits or 0):,.2f}[/green]" if (credits or 0) > 0 else "—",
-            )
-        console.print()
-        console.print(tbl)
+    # Prefer income-based months for the average; fall back to all if none
+    income_splits = {k: v for k, v in splits.items() if v.mode == "income_based"}
+    base = income_splits if income_splits else splits
+    n = len(base)
 
+    avg_needs   = sum(s.needs_pct   for s in base.values()) / n
+    avg_wants   = sum(s.wants_pct   for s in base.values()) / n
+    avg_savings = sum(s.savings_pct for s in base.values()) / n
+    avg_income  = sum(s.income_chf  for s in base.values()) / n
+
+    console.print(
+        f"\n  [bold]Monthly average[/bold] [dim]({n} month{'s' if n != 1 else ''})[/dim]\n"
+        f"  Income:   CHF [bold]{avg_income:,.0f}[/bold] / mo\n"
+        f"  Needs:    [bold]{avg_needs:.1f}%[/bold]\n"
+        f"  Wants:    [bold]{avg_wants:.1f}%[/bold]\n"
+        f"  Savings:  [bold]{avg_savings:.1f}%[/bold]"
+    )
+
+    # Last month vs average
+    last_month_key = max(splits.keys())
+    last = splits[last_month_key]
+
+    tbl = Table(
+        title=f"{last_month_key} vs monthly average",
+        box=None, show_header=True, padding=(0, 2),
+    )
+    tbl.add_column("", style="dim")
+    tbl.add_column("Last month", justify="right")
+    tbl.add_column("Avg", justify="right", style="dim")
+    tbl.add_column("Δ", justify="right")
+
+    def _spend_diff(actual: float, avg: float) -> str:
+        d = actual - avg
+        color = "red" if d > 0 else "green"
+        return f"[{color}]{'+' if d > 0 else ''}{d:.1f}pp[/{color}]"
+
+    def _save_diff(actual: float, avg: float) -> str:
+        d = actual - avg
+        color = "green" if d >= 0 else "red"
+        return f"[{color}]{'+' if d > 0 else ''}{d:.1f}pp[/{color}]"
+
+    tbl.add_row("Needs",   f"{last.needs_pct:.1f}%",   f"{avg_needs:.1f}%",   _spend_diff(last.needs_pct,   avg_needs))
+    tbl.add_row("Wants",   f"{last.wants_pct:.1f}%",   f"{avg_wants:.1f}%",   _spend_diff(last.wants_pct,   avg_wants))
+    tbl.add_row("Savings", f"{last.savings_pct:.1f}%", f"{avg_savings:.1f}%", _save_diff(last.savings_pct, avg_savings))
+    if last.income_chf > 0 and avg_income > 0:
+        d_inc = last.income_chf - avg_income
+        tbl.add_row(
+            "Income (CHF)",
+            f"{last.income_chf:,.0f}",
+            f"{avg_income:,.0f}",
+            f"{'[green]' if d_inc >= 0 else '[red]'}{'+' if d_inc > 0 else ''}{d_inc:,.0f}{'[/green]' if d_inc >= 0 else '[/red]'}",
+        )
+
+    console.print()
+    console.print(tbl)
     console.rule()
 
 
@@ -770,6 +793,159 @@ def stage_etl_loader(
         console.print("[dim]No folder provided — skipping import.[/dim]")
         return ""
     return run_etl_pipeline(conn, user_id, account_id, csv_folder, console)
+
+
+def stage_category_setup(
+    console,
+    conn: sqlite3.Connection,
+    user_id: str,
+) -> None:
+    """Show default taxonomy and let the user add, rename, or hide categories.
+
+    Changes are stored in user_categories and respected by the Labeller
+    agent via get_effective_taxonomy(). This step is shown after CSV import
+    so the user can see what categories exist before labeling runs.
+    """
+    import uuid
+    from datetime import timezone as _tz
+    from rich.table import Table
+    from categories import get_effective_taxonomy
+
+    console.print()
+    console.rule("[bold]Category Setup[/bold]")
+    console.print(
+        "  [dim]These are the default categories used to label your transactions.\n"
+        "  You can add, rename, or hide categories before labeling begins.\n"
+        "  Press [bold]d[/bold] (or Enter) when done.[/dim]\n"
+    )
+
+    _GROUP_ORDER = {"Income": 0, "Needs": 1, "Wants": 2, "Extras": 3}
+
+    def _show() -> tuple[list, dict]:
+        cats = get_effective_taxonomy(conn, user_id)
+        cats_sorted = sorted(cats, key=lambda c: (_GROUP_ORDER.get(c.group, 9), c.name))
+        tbl = Table(box=None, show_header=True, padding=(0, 2))
+        tbl.add_column("#", style="bold cyan", width=4)
+        tbl.add_column("Key", style="dim", min_width=22)
+        tbl.add_column("Display Name", style="bold", min_width=24)
+        tbl.add_column("Group", style="dim")
+        current_group = None
+        idx_map: dict[int, object] = {}
+        for i, cat in enumerate(cats_sorted, 1):
+            if cat.group != current_group:
+                current_group = cat.group
+                tbl.add_row("", f"[bold]{cat.group}[/bold]", "", "")
+            tbl.add_row(str(i), cat.key, cat.name, cat.top_type)
+            idx_map[i] = cat
+        console.print(tbl)
+        return cats_sorted, idx_map
+
+    while True:
+        _cats_sorted, idx_map = _show()
+        console.print(
+            "\n  [bold cyan]a[/bold cyan] Add   "
+            "[bold cyan]r[/bold cyan] Rename   "
+            "[bold cyan]h[/bold cyan] Hide   "
+            "[bold cyan]d[/bold cyan] Done\n"
+        )
+        try:
+            choice = console.input("  choice › ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            break
+
+        if choice in ("d", "done", ""):
+            break
+
+        elif choice in ("a", "add"):
+            try:
+                key_in = console.input("  New key (e.g. gym_membership) › ").strip().lower().replace(" ", "_")
+                name_in = console.input("  Display name › ").strip()
+                grp_in = console.input("  Group — Needs / Wants / Income / Extras [Wants] › ").strip() or "Wants"
+                grp = grp_in.capitalize()
+                if grp not in ("Needs", "Wants", "Income", "Extras"):
+                    console.print("  [red]Use one of: Needs, Wants, Income, Extras.[/red]")
+                    continue
+                if not key_in or not name_in:
+                    console.print("  [red]Key and name are required.[/red]")
+                    continue
+                top_type = "Expenses" if grp in ("Needs", "Wants") else grp
+                now = datetime.now(_tz.utc).isoformat()
+                conn.execute(
+                    "INSERT OR REPLACE INTO user_categories"
+                    "(id, user_id, key, name, group_name, top_type, is_override, hidden, created_at) "
+                    "VALUES(?,?,?,?,?,?,0,0,?)",
+                    (str(uuid.uuid4()), user_id, key_in, name_in, grp, top_type, now),
+                )
+                conn.commit()
+                console.print(f"  [green]Added: {key_in} → {name_in} ({grp})[/green]")
+            except (EOFError, KeyboardInterrupt):
+                continue
+
+        elif choice in ("r", "rename"):
+            try:
+                raw = console.input("  Category # to rename › ").strip()
+                if not raw.isdigit() or int(raw) not in idx_map:
+                    console.print("  [red]Invalid number.[/red]")
+                    continue
+                cat = idx_map[int(raw)]
+                new_name = console.input(f"  New display name for '{cat.name}' › ").strip()
+                if not new_name:
+                    continue
+                now = datetime.now(_tz.utc).isoformat()
+                conn.execute(
+                    "INSERT OR REPLACE INTO user_categories"
+                    "(id, user_id, key, name, group_name, top_type, is_override, hidden, created_at) "
+                    "VALUES(?,?,?,?,?,?,1,0,?)",
+                    (str(uuid.uuid4()), user_id, cat.key, new_name, cat.group, cat.top_type, now),
+                )
+                conn.commit()
+                console.print(f"  [green]Renamed '{cat.key}': {cat.name} → {new_name}[/green]")
+            except (EOFError, KeyboardInterrupt):
+                continue
+
+        elif choice in ("h", "hide"):
+            try:
+                raw = console.input("  Category # to hide › ").strip()
+                if not raw.isdigit() or int(raw) not in idx_map:
+                    console.print("  [red]Invalid number.[/red]")
+                    continue
+                cat = idx_map[int(raw)]
+                now = datetime.now(_tz.utc).isoformat()
+                conn.execute(
+                    "INSERT OR REPLACE INTO user_categories"
+                    "(id, user_id, key, name, group_name, top_type, is_override, hidden, created_at) "
+                    "VALUES(?,?,?,?,?,?,0,1,?)",
+                    (str(uuid.uuid4()), user_id, cat.key, cat.name, cat.group, cat.top_type, now),
+                )
+                conn.commit()
+                console.print(f"  [dim]Hidden: {cat.key} ({cat.name})[/dim]")
+            except (EOFError, KeyboardInterrupt):
+                continue
+
+        else:
+            console.print("  [red]Unknown option.[/red]")
+
+    console.rule()
+
+
+def stage_enrich(
+    console,
+    conn: sqlite3.Connection,
+    user_id: str,
+) -> None:
+    """Run deterministic enrichment passes after the Labeller has assigned categories."""
+    from tools.enrichment import enrich_transactions
+
+    with console.status("[dim]Enriching transaction dataset…[/dim]", spinner="dots"):
+        summary = enrich_transactions(conn, user_id)
+
+    console.print(
+        f"  [green]Enrichment complete[/green]  "
+        f"[dim]transfers flagged: {summary['transfers_flagged']}  "
+        f"recurring detected: {summary['recurring_detected']}  "
+        f"fixed-cost rows: {summary['fixed_classified']}  "
+        f"confidence scored: {summary['confidence_scored']}[/dim]"
+    )
 
 
 def stage_labeller(
@@ -991,15 +1167,24 @@ def run_startup(console, model_override: str | None = None) -> StartupState:
         state.stage = StartupStage.ETL_LOADER
         stage_etl_loader(console, state.llm, state.conn, USER_ID, ACCOUNT_ID)
 
+        # Stage 4.5 — Category Setup: review/edit taxonomy before labeling
+        state.stage = StartupStage.CATEGORY_SETUP
+        stage_category_setup(console, state.conn, USER_ID)
+
         # Stage 5 — Labeller: clean names, classify buckets
         state.stage = StartupStage.LABELLER
         stage_labeller(console, state.llm, state.conn, USER_ID)
 
-        # Stage 5.5 — Rules Review: LLM-assisted rules for unlabeled merchants
-        # Runs BEFORE budget onboarding so users can classify merchants accurately
-        # rather than having them bulk-assigned as 'want'.
+        # Stage 5.5 — Rules Review: LLM-assisted rules for unlabeled merchants.
+        # Runs BEFORE enrichment so all line_categories are set before normalization.
         state.stage = StartupStage.RULES_REVIEW
         stage_rules_review(console, state.llm, state.conn, USER_ID)
+
+        # Stage 5.75 — Enrichment: normalize categories, flag transfers/recurring,
+        # classify fixed vs variable, score confidence.
+        # Runs AFTER rules review so line_category is fully populated first.
+        state.stage = StartupStage.ENRICH
+        stage_enrich(console, state.conn, USER_ID)
 
         # Stage 6 — Budget Onboarding: assign need/want/savings if none exist yet
         uncategorized_count = state.conn.execute(

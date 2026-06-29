@@ -215,6 +215,22 @@ CREATE TABLE IF NOT EXISTS pending_notifications (
     created_at      TEXT NOT NULL,
     resolved_at     TEXT
 );
+
+-- ── User category customizations ────────────────────────────────────────────
+-- Overrides (rename/hide) and additions to the default TAXONOMY in categories.py.
+-- Queried by get_effective_taxonomy() to produce the per-user taxonomy view.
+CREATE TABLE IF NOT EXISTS user_categories (
+    id          TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL REFERENCES users(id),
+    key         TEXT NOT NULL,           -- slug matching TAXONOMY or a new custom key
+    name        TEXT NOT NULL,           -- display name
+    group_name  TEXT NOT NULL,           -- 'Needs' | 'Wants' | 'Income' | 'Extras'
+    top_type    TEXT NOT NULL DEFAULT 'Expenses',
+    is_override INTEGER DEFAULT 0,       -- 1 = overriding display name of an existing key
+    hidden      INTEGER DEFAULT 0,       -- 1 = user hid this category
+    created_at  TEXT NOT NULL,
+    UNIQUE(user_id, key)
+);
 """
 
 
@@ -313,6 +329,17 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "ALTER TABLE category_proposals ADD COLUMN proposed_normalized TEXT"
             )
+
+    # enrichment columns added for ETL enrichment pass
+    for col, col_def in [
+        ("is_recurring",         "INTEGER DEFAULT 0"),
+        ("recurrence_cadence",   "TEXT"),
+        ("is_transfer",          "INTEGER DEFAULT 0"),
+        ("enrichment_confidence","REAL"),
+        ("is_fixed",             "INTEGER DEFAULT 0"),
+    ]:
+        if col not in cols:
+            conn.execute(f"ALTER TABLE transactions ADD COLUMN {col} {col_def}")
 
     # accounts columns added for multi-account support
     acct_cols = _table_columns(conn, "accounts")

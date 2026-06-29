@@ -150,7 +150,7 @@ def test_stage_summary_computes_income_from_real_data(mem_db):
 
     printed = "\n".join(console.printed)
     # Three salary payments of CHF 5200 each = CHF 15,600 income
-    assert "15,600.00" in printed or "15600" in printed
+    assert "15,600" in printed or "15600" in printed
 
 
 def test_stage_summary_empty_ledger_no_crash(mem_db):
